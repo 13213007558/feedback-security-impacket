@@ -294,7 +294,7 @@ class SMBConnection:
             raise SessionError(e.get_error_code(), e.get_error_packet())
 
     def kerberosLogin(self, user, password, domain='', lmhash='', nthash='', aesKey='', kdcHost=None, TGT=None,
-                      TGS=None, useCache=True):
+                      TGS=None, useCache=True, cachePolicy=None):
         """
         Authenticates against the target system using Kerberos.
         Hashes are used if RC4_HMAC is supported.
@@ -310,6 +310,11 @@ class SMBConnection:
         :param optional struct TGS: Same for TGS. See smb3.py for the format.
         :param optional bool useCache: Whether or not we should use the ccache for credentials lookup.
                                        If TGT or TGS are specified this is False
+        :param optional KerberosCachePolicy cachePolicy: cache selection policy. Pass
+                                       KerberosCachePolicy.strict() to require a verified ticket for
+                                       cifs/<target> (CachePolicyError is raised before any packet is
+                                       sent when nothing verifies). Default (None) is the historical
+                                       loose matching.
 
         :return: None
         :raise SessionError: If encountered an error.
@@ -325,7 +330,8 @@ class SMBConnection:
             useCache = False
 
         if useCache:
-            domain, user, TGT, TGS = CCache.parseFile(domain, user, 'cifs/%s' % self.getRemoteName())
+            domain, user, TGT, TGS = CCache.parseFile(domain, user, 'cifs/%s' % self.getRemoteName(),
+                                                      cachePolicy=cachePolicy)
 
         while True:
             try:

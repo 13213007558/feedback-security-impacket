@@ -366,7 +366,7 @@ class LDAPConnection:
         LOG.debug('Client certificate mapped to %s' % identity)
 
     def kerberosLogin(self, user, password, domain='', lmhash='', nthash='', aesKey='', kdcHost=None, TGT=None,
-                      TGS=None, useCache=True):
+                      TGS=None, useCache=True, cachePolicy=None):
         """
         logins into the target system explicitly using Kerberos. Hashes are used if RC4_HMAC is supported.
 
@@ -380,6 +380,9 @@ class LDAPConnection:
         :param struct TGT: If there's a TGT available, send the structure here and it will be used
         :param struct TGS: same for TGS. See smb3.py for the format
         :param bool useCache: whether or not we should use the ccache for credentials lookup. If TGT or TGS are specified this is False
+        :param KerberosCachePolicy cachePolicy: cache selection policy. Pass KerberosCachePolicy.strict() to require a
+            verified ticket for ldap/<target> (CachePolicyError is raised before the bind request is built when
+            nothing verifies). Default (None) is the historical loose matching.
 
         :return: True, raises a LDAPSessionError if error.
         """
@@ -409,7 +412,7 @@ class LDAPConnection:
 
         targetName = 'ldap/%s' % self._dstHost
         if useCache:
-            domain, user, TGT, TGS = CCache.parseFile(domain, user, targetName)
+            domain, user, TGT, TGS = CCache.parseFile(domain, user, targetName, cachePolicy=cachePolicy)
 
         # First of all, we need to get a TGT for the user
         userName = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)

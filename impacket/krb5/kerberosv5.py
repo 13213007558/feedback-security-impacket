@@ -582,7 +582,7 @@ def getKerberosType3(cipher, sessionKey, auth_data):
 
 
 def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT = None, TGS = None, targetName='',
-                     kdcHost = None, useCache = True):
+                     kdcHost = None, useCache = True, cachePolicy = None):
 
     # Convert to binary form, just in case we're receiving strings
     if isinstance(lmhash, str):
@@ -604,7 +604,7 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
     targetName = 'host/%s' % targetName
     if TGT is None and TGS is None:
         if useCache:
-            domain, username, TGT, TGS = CCache.parseFile(domain, username, targetName)
+            domain, username, TGT, TGS = CCache.parseFile(domain, username, targetName, cachePolicy=cachePolicy)
 
     # First of all, we need to get a TGT for the user
     userName = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)

@@ -41,6 +41,150 @@ except NameError:
 
 DELTA_TIME = 1
 
+
+class CachePolicyError(Exception):
+    """
+    Raised by strict Kerberos cache selection when no verified credential is
+    available for the requested service. It is raised before any
+    authentication message (AP_REQ) is built or sent, so a failed cache
+    lookup never falls back silently to another service's ticket.
+    """
+    pass
+
+
+class KerberosCachePolicy:
+    """
+    Selects how a CCache entry is picked for a requested SPN.
+
+    Modes
+    =====
+    - ``legacy``: the historical impacket behaviour. Exact match first, then
+      the ``anySPN`` relaxed match (any service name accepted for the same
+      host/realm, short-name/FQDN equivalence, machine-account heuristics).
+      This is the default when no policy is passed, and can also be requested
+      explicitly with :meth:`legacy`.
+    - ``strict``: every aspect of the match must be verified. The requested
+      service, host and realm must match the cache entry exactly (after the
+      configured normalization), and the cache entry's server principal must
+      match the principal inside the actual Kerberos ticket it carries, so a
+      cache entry whose index was tampered with (e.g. relabelled
+      ``cifs/host`` while the ticket is really for ``ldap/host``) is
+      rejected. There is no ``anySPN`` fallback: one ticket for a host is
+      NOT treated as a credential for every service on that host.
+
+    Trusted configuration entry points (strict mode)
+    ================================================
+    All relaxation in strict mode is explicit, passed by the caller:
+
+    - ``case_sensitive``: by default service and host names are compared
+      case-insensitively (service upper-cased, host lower-cased); realms are
+      ALWAYS compared case-insensitively since they are upper-case by
+      convention. Set to True only if your KDC issues case-significant
+      principal names.
+    - ``host_aliases``: dict mapping an alias host name to its canonical
+      name (e.g. ``{'fileserver': 'fileserver.example.test'}``). Both the
+      requested and the cached host are canonicalized through it. Short
+      name vs FQDN is NOT matched automatically; add an alias if you trust
+      the equivalence.
+    - ``service_aliases``: dict mapping a requested service name to the
+      iterable of cached service names accepted for it
+      (e.g. ``{'cifs': ['host']}``). Without it, only the exact same
+      service name matches. Windows' implicit SPN substitutions
+      (cifs/ldap/http -> host) are never applied automatically.
+    - ``allowed_realms``: optional iterable of realms the requested SPN is
+      allowed to target; anything else is rejected before scanning the
+      cache.
+
+    Migrating from legacy mode
+    ==========================
+    Switching to strict mode surfaces these problems early (as
+    :class:`CachePolicyError`, before any packet is sent) instead of
+    silently authenticating with the wrong ticket:
+
+    - caches that only worked because of ``anySPN`` cross-service reuse
+      (e.g. an ``ldap/`` ticket used for ``cifs/``);
+    - short-name vs FQDN mismatches that need an explicit ``host_aliases``
+      entry;
+    - service substitutions (``cifs`` -> ``host`` and friends) that need an
+      explicit ``service_aliases`` entry;
+    - cache entries whose embedded ticket does not match their claimed
+      server principal (cache index spoofing or corrupted caches);
+    - requests for the wrong realm, previously masked by loose matching;
+    - missing tickets, which now fail closed instead of silently falling
+      back to password-based TGT retrieval.
+    """
+
+    MODE_LEGACY = 'legacy'
+    MODE_STRICT = 'strict'
+
+    def __init__(self, mode=MODE_LEGACY, case_sensitive=False, host_aliases=None, service_aliases=None,
+                 allowed_realms=None):
+        if mode not in (self.MODE_LEGACY, self.MODE_STRICT):
+            raise ValueError('Unknown Kerberos cache policy mode: %r' % (mode,))
+        self.mode = mode
+        self.case_sensitive = bool(case_sensitive)
+        self.host_aliases = {}
+        for alias, canonical in (host_aliases or {}).items():
+            self.host_aliases[self.normalizeHost(alias)] = self.normalizeHost(canonical)
+        self.service_aliases = {}
+        for requested, accepted in (service_aliases or {}).items():
+            self.service_aliases[self.normalizeService(requested)] = \
+                set(self.normalizeService(service) for service in accepted)
+        self.allowed_realms = None
+        if allowed_realms is not None:
+            self.allowed_realms = set(self.normalizeRealm(realm) for realm in allowed_realms)
+
+    @classmethod
+    def strict(cls, **kwargs):
+        """Returns a strict-mode policy. All relaxation must be passed explicitly as kwargs."""
+        kwargs['mode'] = cls.MODE_STRICT
+        return cls(**kwargs)
+
+    @classmethod
+    def legacy(cls):
+        """Returns a policy explicitly requesting the historical loose matching behaviour."""
+        return cls(mode=cls.MODE_LEGACY)
+
+    def normalizeService(self, service):
+        return service if self.case_sensitive else service.upper()
+
+    def normalizeHost(self, host):
+        # A port or instance suffix (host:445, host:1433) is not part of the host identity
+        host = host.split(':', 1)[0].rstrip('.')
+        return host if self.case_sensitive else host.lower()
+
+    def normalizeRealm(self, realm):
+        # Realms are upper-case by convention and always matched case-insensitively
+        return realm.upper()
+
+    def canonicalHost(self, host):
+        normalized = self.normalizeHost(host)
+        return self.host_aliases.get(normalized, normalized)
+
+    def serviceAccepted(self, requested, cached):
+        requested = self.normalizeService(requested)
+        cached = self.normalizeService(cached)
+        if requested == cached:
+            return True
+        return cached in self.service_aliases.get(requested, ())
+
+    @staticmethod
+    def parseStrictSPN(spn):
+        """
+        Splits a 'service/host@REALM' SPN. Strict mode only accepts exactly
+        two name components; anything else raises CachePolicyError.
+        """
+        if spn.count('@') != 1:
+            raise CachePolicyError('Strict cache policy: malformed SPN %r (expected service/host@REALM)' % spn)
+        name, realm = spn.rsplit('@', 1)
+        if name.count('/') != 1:
+            raise CachePolicyError('Strict cache policy: malformed SPN %r (expected exactly service/host)' % spn)
+        service, host = name.split('/', 1)
+        if not service or not host or not realm:
+            raise CachePolicyError('Strict cache policy: malformed SPN %r (empty component)' % spn)
+        return service, host, realm
+
+
 class Header(Structure):
     structure = (
         ('tag','!H=0'),
@@ -460,6 +604,105 @@ class CCache:
 
         return None
 
+    @staticmethod
+    def _strictCredentialSPN(credential):
+        """
+        Returns the (service, host, realm) of a cache entry, or None if the
+        entry's server principal is not exactly a two-component
+        'service/host@REALM' name (strict mode never guesses how to map
+        extra components such as LSASS-style service/host/domain names).
+        """
+        server = credential['server']
+        if len(server.components) != 2:
+            return None
+        service = server.components[0]['data']
+        host = server.components[1]['data']
+        realm = server.realm['data']
+        if isinstance(service, bytes):
+            service = service.decode('utf-8', 'replace')
+        if isinstance(host, bytes):
+            host = host.decode('utf-8', 'replace')
+        if isinstance(realm, bytes):
+            realm = realm.decode('utf-8', 'replace')
+        return service, host, realm
+
+    @staticmethod
+    def _credentialTicketMatches(credential, policy):
+        """
+        Verifies that the server principal claimed by the cache entry index
+        matches the principal inside the actual Kerberos ticket the entry
+        carries. A cache entry can be relabelled (cache index spoofing) so
+        that a loose lookup returns a ticket for a different service or
+        host; strict mode rejects any entry that fails this check, as well
+        as entries whose ticket cannot be decoded at all.
+        """
+        parsed = CCache._strictCredentialSPN(credential)
+        if parsed is None:
+            return False
+        service, host, realm = parsed
+        try:
+            ticket = types.Ticket()
+            ticket.from_asn1(credential.ticket['data'])
+        except Exception:
+            LOG.debug('Strict cache policy: cannot decode ticket of cache entry %s/%s@%s, rejecting it'
+                      % (service, host, realm))
+            return False
+        serverPrincipal = ticket.service_principal
+        if serverPrincipal is None or len(serverPrincipal.components) != 2:
+            LOG.warning('Strict cache policy: ticket of cache entry %s/%s@%s has an unexpected sname, rejecting it'
+                        % (service, host, realm))
+            return False
+        if policy.normalizeService(serverPrincipal.components[0]) != policy.normalizeService(service):
+            return False
+        if policy.normalizeHost(serverPrincipal.components[1]) != policy.normalizeHost(host):
+            return False
+        if policy.normalizeRealm(serverPrincipal.realm) != policy.normalizeRealm(realm):
+            return False
+        return True
+
+    def getCredentialStrict(self, server, policy):
+        """
+        Strict-mode counterpart of getCredential(). Returns the cache entry
+        for 'service/host@REALM' only if the service, host and realm match
+        exactly (after the policy's configured normalization and explicit
+        alias configuration) AND the entry's embedded ticket really is for
+        that principal. There is deliberately no anySPN-style fallback: a
+        ticket for one service on a host is never reused for another
+        service unless the caller explicitly trusted that substitution via
+        the policy's service_aliases.
+
+        :param server: the requested SPN, 'service/host@REALM'
+        :param policy: a KerberosCachePolicy with mode MODE_STRICT
+        :return: the matching Credential, or None (the reason is logged)
+        """
+        service, host, realm = KerberosCachePolicy.parseStrictSPN(server)
+
+        if policy.allowed_realms is not None and policy.normalizeRealm(realm) not in policy.allowed_realms:
+            LOG.debug('Strict cache policy: realm %s is not in the allowed realms' % policy.normalizeRealm(realm))
+            return None
+
+        for c in self.credentials:
+            parsed = self._strictCredentialSPN(c)
+            if parsed is None:
+                continue
+            cachedService, cachedHost, cachedRealm = parsed
+            if policy.normalizeRealm(cachedRealm) != policy.normalizeRealm(realm):
+                continue
+            if not policy.serviceAccepted(service, cachedService):
+                continue
+            if policy.canonicalHost(host) != policy.canonicalHost(cachedHost):
+                continue
+            if not self._credentialTicketMatches(c, policy):
+                LOG.warning('Strict cache policy: cache entry %s/%s@%s does not match its embedded ticket, '
+                            'ignoring it (possible cache index spoofing)' % (cachedService, cachedHost, cachedRealm))
+                continue
+            LOG.debug('Strict cache policy: returning verified credential for %s' % c['server'].prettyPrint()
+                      .decode('utf-8', 'replace'))
+            return c
+
+        LOG.debug('Strict cache policy: no verified credential for %s in cache' % server)
+        return None
+
     def getInterRealmTGT(self, domain, targetRealm=None):
         """
         Returns an inter-realm (referral) TGT issued by domain, that is a
@@ -654,22 +897,35 @@ class CCache:
         f.close()
 
     @classmethod
-    def parseFile(cls, domain='', username='', target=''):
+    def parseFile(cls, domain='', username='', target='', cachePolicy=None):
         """
         parses the CCache file specified in the KRB5CCNAME environment variable
 
         :param domain: an optional domain name of a user
         :param username: an optional username of a user
         :param target: an optional SPN of a target system
+        :param cachePolicy: an optional KerberosCachePolicy. When it is a
+                            strict-mode policy, cache selection verifies the
+                            requested service/host/realm and the ticket
+                            inside each cache entry, and raises
+                            CachePolicyError when nothing verifies. When
+                            None (or KerberosCachePolicy.legacy()), the
+                            historical loose matching is used.
 
         :return: domain, username, TGT, TGS
         """
 
         ccache = cls.loadFile(os.getenv('KRB5CCNAME'))
         if ccache is None:
+            if cachePolicy is not None and cachePolicy.mode == KerberosCachePolicy.MODE_STRICT:
+                raise CachePolicyError('Strict Kerberos cache policy: no credential cache available '
+                                       '(KRB5CCNAME is not set or not readable)')
             return domain, username, None, None
 
         LOG.debug('Using Kerberos Cache: %s' % os.getenv('KRB5CCNAME'))
+
+        if cachePolicy is not None and cachePolicy.mode == KerberosCachePolicy.MODE_STRICT:
+            return cls._parseFileStrict(ccache, domain, username, target, cachePolicy)
 
         if domain == '':
             domain = ccache.principal.realm['data'].decode('utf-8')
@@ -704,6 +960,60 @@ class CCache:
             LOG.debug('Username retrieved from CCache: %s' % username)
         elif username == '' and len(ccache.principal.components) > 0:
             username = ccache.principal.components[0]['data'].decode('utf-8')
+            LOG.debug('Username retrieved from CCache: %s' % username)
+
+        return domain, username, TGT, TGS
+
+    @classmethod
+    def _parseFileStrict(cls, ccache, domain, username, target, policy):
+        """
+        Strict-mode cache selection used by parseFile(). Either returns a
+        verified (domain, username, TGT, TGS) tuple or raises
+        CachePolicyError before any authentication message is built. Unlike
+        the legacy path it never falls back silently: no anySPN reuse, no
+        unverified ticket, no password-based retry is implied by a miss.
+        """
+        if domain == '':
+            domain = ccache.principal.realm['data']
+            if isinstance(domain, bytes):
+                domain = domain.decode('utf-8')
+            LOG.debug('Domain retrieved from CCache: %s' % domain)
+
+        creds = None
+        principal = None
+        if target != '':
+            principal = '%s@%s' % (target.upper(), domain.upper())
+            creds = ccache.getCredentialStrict(principal, policy)
+
+        TGT = None
+        TGS = None
+        if creds is not None:
+            LOG.debug('Using strictly verified TGS from cache')
+            TGS = creds.toTGS(principal)
+        else:
+            # A TGT is realm-bound, not service-bound, so falling back to a
+            # verified one is still strict: the KDC decides the rest.
+            tgtPrincipal = 'krbtgt/%s@%s' % (domain.upper(), domain.upper())
+            creds = ccache.getCredentialStrict(tgtPrincipal, policy)
+            if creds is None:
+                targetHost = target.split('/')[-1].split('@')[0].split(':', 1)[0]
+                # the target's DNS suffix is only a hint, used to choose between several referral TGTs
+                targetRealm = targetHost.split('.', 1)[1] if '.' in targetHost else None
+                referral = ccache.getInterRealmTGT(domain, targetRealm)
+                if referral is not None and ccache._credentialTicketMatches(referral, policy):
+                    creds = referral
+            if creds is not None:
+                LOG.debug('Using strictly verified TGT from cache')
+                TGT = creds.toTGT()
+            else:
+                requested = principal if principal is not None else 'krbtgt/%s@%s' % (domain.upper(), domain.upper())
+                raise CachePolicyError('Strict Kerberos cache policy: no verified credential in cache for %s. '
+                                       'Not building an authentication message; request a ticket for this exact '
+                                       'SPN, or pass a KerberosCachePolicy with explicit host_aliases/'
+                                       'service_aliases if the substitution is trusted.' % requested)
+
+        if username == '':
+            username = creds['client'].prettyPrint().split(b'@')[0].decode('utf-8')
             LOG.debug('Username retrieved from CCache: %s' % username)
 
         return domain, username, TGT, TGS

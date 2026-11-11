@@ -7,7 +7,12 @@ https://github.com/fortra/impacket/commits/master
 
 ## Unreleased:
 
-1. Examples improvements
+1. Library improvements
+
+    * [ccache.py](impacket/krb5/ccache.py):
+        * Added an opt-in strict Kerberos cache selection mode (`KerberosCachePolicy.strict()`). Strict mode verifies the requested service, host and realm against the cache entry and verifies the entry against the principal inside the actual ticket it carries (defeating cache index spoofing), with no `anySPN` fallback. Case handling, host aliases and service-name substitution are only relaxed through explicit trusted configuration (`case_sensitive`, `host_aliases`, `service_aliases`, `allowed_realms`). When nothing verifies, `CachePolicyError` is raised before any authentication message is built. The strict policy can be passed to `CCache.parseFile()`, `SMBConnection.kerberosLogin()`, `LDAPConnection.kerberosLogin()` and `DCERPC_v5` (`set_cache_policy()`); the historical loose matching remains the default and can be requested explicitly with `KerberosCachePolicy.legacy()`.
+
+2. Examples improvements
 
     * [ntlmrelayx.py](examples/ntlmrelayx.py):
         * Added `--adcs-ces` support for relaying to AD CS Certificate Enrollment Services (CES/WSTEP). CES mode reuses the existing HTTP relay authentication, target, template, listener, SMB2, and loot directory behavior; generates its CSR automatically; and writes DER, PKCS#7, and PFX artifacts to the configured loot directory.

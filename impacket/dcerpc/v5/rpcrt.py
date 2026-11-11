@@ -1457,6 +1457,7 @@ class DCERPC_v5(DCERPC):
         self.__aesKey = ''
         self.__TGT    = None
         self.__TGS    = None
+        self.__cachePolicy = None
 
         self.__aesNegociated = False
         self.__clientSigningKey = b''
@@ -1492,6 +1493,17 @@ class DCERPC_v5(DCERPC):
     def set_auth_type(self, auth_type, callback = None):
         self.__auth_type = auth_type
         self.__auth_type_callback = callback
+
+    def set_cache_policy(self, cachePolicy):
+        """
+        Sets the Kerberos ccache selection policy used when this connection
+        authenticates with RPC_C_AUTHN_GSS_NEGOTIATE. Pass
+        KerberosCachePolicy.strict() to require a verified ticket for
+        host/<target>; CachePolicyError is then raised before the bind is
+        sent when the cache holds nothing that verifies. Default (None) is
+        the historical loose matching.
+        """
+        self.__cachePolicy = cachePolicy
 
     def get_auth_type(self):
         return self.__auth_type
@@ -1571,7 +1583,8 @@ class DCERPC_v5(DCERPC):
                                                                                      self.__nthash, self.__aesKey,
                                                                                      self.__TGT, self.__TGS,
                                                                                      self._transport.getRemoteName(),
-                                                                                     self._transport.get_kdcHost())
+                                                                                     self._transport.get_kdcHost(),
+                                                                                     cachePolicy=self.__cachePolicy)
             else:
                 raise DCERPCException('Unsupported auth_type 0x%x' % self.__auth_type)
 
