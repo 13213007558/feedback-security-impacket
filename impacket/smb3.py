@@ -44,7 +44,8 @@ from Cryptodome.Cipher import AES
 from impacket import nmb, ntlm, uuid, crypto
 from impacket.smb3structs import *
 from impacket.nt_errors import STATUS_SUCCESS, STATUS_MORE_PROCESSING_REQUIRED, STATUS_INVALID_PARAMETER, \
-    STATUS_NO_MORE_FILES, STATUS_PENDING, STATUS_NOT_IMPLEMENTED, ERROR_MESSAGES
+    STATUS_NO_MORE_FILES, STATUS_PENDING, STATUS_NOT_IMPLEMENTED, STATUS_DECRYPTION_FAILED, \
+    STATUS_CS_ENCRYPTION_INVALID_SERVER_RESPONSE, ERROR_MESSAGES
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp, ASN1_OID, asn1encode, ASN1_AID
 from impacket.krb5.gssapi import KRB5_AP_REQ
 
@@ -313,6 +314,63 @@ class SMB3:
             return AES.new(key, AES.MODE_GCM, nonce[:12])
         return AES.new(key, AES.MODE_CCM, nonce[:11])
 
+    def __decryptTransformMessage(self, data):
+        # Boundary between an SMB2_TRANSFORM_HEADER packet and a plain SMB2
+        # response. Nothing inside the packet may be trusted (and no business
+        # result dispatched) until every check here has passed.
+        # MS-SMB2 3.2.5.1.1.1 Decrypting the Message:
+        # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/d3c03e33-7dc7-4d58-8428-0a1484c5c874
+        transformHeaderLen = len(SMB2_TRANSFORM_HEADER())
+        if len(data) < transformHeaderLen:
+            # Truncated header: the nonce/tag cannot even be located
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+        transformHeader = SMB2_TRANSFORM_HEADER(data)
+        if len(self._Session['DecryptionKey']) == 0:
+            # Encryption was never negotiated for this session
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+        if transformHeader['SessionID'] != self._Session['SessionID']:
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+        if transformHeader['Reserved'] != 0:
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+        # For 3.0/3.0.2 this field is the cipher (only CCM=0x0001 is defined); for
+        # 3.1.1 it is repurposed as Flags and must stay 0x0001 regardless of cipher
+        if transformHeader['EncryptionAlgorithm'] != SMB2_ENCRYPTION_AES128_CCM:
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+        cipherText = data[transformHeaderLen:]
+        if transformHeader['OriginalMessageSize'] != len(cipherText):
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+        cipher = self.__transformCipher(self._Session['DecryptionKey'], transformHeader['Nonce'])
+        cipher.update(transformHeader.getData()[20:])
+        try:
+            return cipher.decrypt_and_verify(cipherText, transformHeader['Signature'])
+        except ValueError:
+            raise SessionError(STATUS_DECRYPTION_FAILED)
+
+    def __verifyPlaintextAllowed(self, packet):
+        # A plaintext response is only acceptable when neither the session nor
+        # the share the request was sent to requires encryption. The decision
+        # relies on trusted local state (SessionFlags, OutstandingRequests as
+        # recorded at send time); the received packet's own TreeID is only ever
+        # used to reject, never to dispatch.
+        if self._Session['SessionFlags'] & SMB2_SESSION_FLAG_ENCRYPT_DATA:
+            raise SessionError(STATUS_CS_ENCRYPTION_INVALID_SERVER_RESPONSE)
+        outstanding = self._Connection['OutstandingRequests'].get(packet['MessageID'])
+        if outstanding is not None and outstanding['EncryptData'] is True:
+            raise SessionError(STATUS_CS_ENCRYPTION_INVALID_SERVER_RESPONSE)
+        treeId = packet['TreeID']
+        if treeId != 0 and (treeId in self._Session['TreeConnectTable']) is True and \
+                self._Session['TreeConnectTable'][treeId]['EncryptData'] is True:
+            raise SessionError(STATUS_CS_ENCRYPTION_INVALID_SERVER_RESPONSE)
+
+    def __recvAndValidatePacket(self):
+        data = self._NetBIOSSession.recv_packet(self._timeout)
+        if data.get_trailer().startswith(b'\xfdSMB'):
+            # Packet is encrypted: authenticate it before anything inside is used
+            return SMB2Packet(self.__decryptTransformMessage(data.get_trailer()))
+        packet = SMB2Packet(data.get_trailer())
+        self.__verifyPlaintextAllowed(packet)
+        return packet
+
     def getKerberos(self):
         return self._doKerberos
 
@@ -448,6 +506,10 @@ class SMB3:
             self._Session['CalculatePreAuthHash'] = True
 
         if (self._Session['SessionFlags'] & SMB2_SESSION_FLAG_ENCRYPT_DATA) or ( packet['TreeID'] != 0 and self._Session['TreeConnectTable'][packet['TreeID']]['EncryptData'] is True):
+            # Remember this request must be answered encrypted, so recvSMB can
+            # reject a plaintext response without trusting the packet's own
+            # TreeID/MessageID. Cleaned up once the response is matched.
+            self._Connection['OutstandingRequests'][messageId] = {'EncryptData': True}
             plainText = packet.getData()
             transformHeader = SMB2_TRANSFORM_HEADER()
             transformHeader['Nonce'] = ''.join([rand.choice(string.ascii_letters) for _ in range(self.__nonceLength())])
@@ -466,6 +528,7 @@ class SMB3:
 
             self._NetBIOSSession.send_packet(packet)
         else:
+            self._Connection['OutstandingRequests'][messageId] = {'EncryptData': False}
             data = packet.getData()
             if self._Session['CalculatePreAuthHash'] is True:
                 self.__UpdatePreAuthHash(data)
@@ -479,43 +542,17 @@ class SMB3:
         if packetID in self._Connection['OutstandingResponses']:
             return self._Connection['OutstandingResponses'].pop(packetID)
 
-        data = self._NetBIOSSession.recv_packet(self._timeout)
-
-        if data.get_trailer().startswith(b'\xfdSMB'):
-            # Packet is encrypted
-            transformHeader = SMB2_TRANSFORM_HEADER(data.get_trailer())
-            cipher = self.__transformCipher(self._Session['DecryptionKey'], transformHeader['Nonce'])
-            cipher.update(transformHeader.getData()[20:])
-            # Verify the signature, not just decrypt: a tampered message must be rejected,
-            # not silently handed back as plaintext. MS-SMB2 3.2.5.1.1.1 Decrypting the Message:
-            # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/d3c03e33-7dc7-4d58-8428-0a1484c5c874
-            plainText = cipher.decrypt_and_verify(data.get_trailer()[len(SMB2_TRANSFORM_HEADER()):],
-                                                   transformHeader['Signature'])
-            packet = SMB2Packet(plainText)
-        else:
-            # In all SMB dialects for a response this field is interpreted as the Status field.
-            # This field can be set to any value. For a list of valid status codes,
-            # see [MS-ERREF] section 2.3.
-            packet = SMB2Packet(data.get_trailer())
-
-        # Loop while we receive pending requests
-        if packet['Status'] == STATUS_PENDING:
-            status = STATUS_PENDING
-            while status == STATUS_PENDING:
-                data = self._NetBIOSSession.recv_packet(self._timeout)
-                if data.get_trailer().startswith(b'\xfeSMB'):
-                    packet = SMB2Packet(data.get_trailer())
-                else:
-                    # Packet is encrypted
-                    transformHeader = SMB2_TRANSFORM_HEADER(data.get_trailer())
-                    cipher = self.__transformCipher(self._Session['DecryptionKey'], transformHeader['Nonce'])
-                    cipher.update(transformHeader.getData()[20:])
-                    # See the tag-verification note above: same MS-SMB2 3.2.5.1.1.1 requirement
-                    # applies to encrypted STATUS_PENDING interim responses.
-                    plainText = cipher.decrypt_and_verify(data.get_trailer()[len(SMB2_TRANSFORM_HEADER()):],
-                                                           transformHeader['Signature'])
-                    packet = SMB2Packet(plainText)
-                status = packet['Status']
+        try:
+            packet = self.__recvAndValidatePacket()
+            # Loop while we receive pending requests
+            while packet['Status'] == STATUS_PENDING:
+                packet = self.__recvAndValidatePacket()
+        except Exception:
+            # Validation/authentication failed: drop the pending request state
+            # instead of leaving it matchable by a later, unrelated response.
+            if packetID is not None:
+                self._Connection['OutstandingRequests'].pop(packetID, None)
+            raise
 
         if packet['MessageID'] == packetID or packetID is None:
             # Let's update the sequenceWindow based on the CreditsCharged
@@ -524,8 +561,10 @@ class SMB3:
             # In all other dialects, this field indicates the number of credits that this request consumes.
             if self._Connection['Dialect'] > SMB2_DIALECT_002:
                 self._Connection['SequenceWindow'] += (packet['CreditCharge'] - 1)
+            self._Connection['OutstandingRequests'].pop(packet['MessageID'], None)
             return packet
         else:
+            self._Connection['OutstandingRequests'].pop(packet['MessageID'], None)
             self._Connection['OutstandingResponses'][packet['MessageID']] = packet
             return self.recvSMB(packetID)
 
