@@ -306,6 +306,18 @@ class GSSAPI_RC4:
     def GSS_Unwrap_LDAP(self, sessionKey, data, sequenceNumber, direction = 'init'):
         return self.GSS_Wrap_LDAP(sessionKey, data, sequenceNumber, direction, encrypt=False)
 
+class GSSAPITokenError(ValueError):
+    """A received GSS per-message token failed structural or integrity validation.
+
+    Carries the byte ``offset`` (within the token) and the ``field`` name where
+    the failure was detected so callers and tests can pinpoint the rejection.
+    """
+    def __init__(self, message, offset=None, field=None):
+        ValueError.__init__(self, message)
+        self.offset = offset
+        self.field = field
+
+
 class GSSAPI_AES():
     checkSumProfile = None
     cipherType = None
@@ -331,6 +343,51 @@ class GSSAPI_AES():
             ('SND_SEQ','8s=b""'),
         )
 
+    # RFC 4121 section 4.2.2 token flag bits
+    _FLAG_SENDER_IS_ACCEPTOR = 0x01
+    _FLAG_SEALED = 0x02
+    _FLAG_ACCEPTOR_SUBKEY = 0x04
+
+    _WRAP_TOK_ID = 0x0504
+    _MIC_TOK_ID = 0x0404
+    _WRAP_FILLER = 0xff
+    _SEALED_RRC = 28
+    _SIGN_ONLY_RRC = 12
+    _CHECKSUM_LEN = 12
+
+    # -- key usage / direction handling -----------------------------------
+    # ``direction`` names the LOCAL role.  The party that produced a token we
+    # receive is the peer, so unwrapping selects the opposite role's usage.
+    @staticmethod
+    def _peer(direction):
+        return 'accept' if direction == 'init' else 'init'
+
+    @classmethod
+    def _seal_usage(cls, sender):
+        return KG_USAGE_INITIATOR_SEAL if sender == 'init' else KG_USAGE_ACCEPTOR_SEAL
+
+    @classmethod
+    def _sign_usage(cls, sender):
+        return KG_USAGE_INITIATOR_SIGN if sender == 'init' else KG_USAGE_ACCEPTOR_SIGN
+
+    @classmethod
+    def _flags_for(cls, sender, sealed):
+        flags = cls._FLAG_ACCEPTOR_SUBKEY
+        if sender == 'accept':
+            flags |= cls._FLAG_SENDER_IS_ACCEPTOR
+        if sealed:
+            flags |= cls._FLAG_SEALED
+        return flags
+
+    # -- token construction ------------------------------------------------
+    def _build_wrap_header(self, sender, sealed, ec, rrc, sequenceNumber):
+        token = self.WRAP()
+        token['Flags'] = self._flags_for(sender, sealed)
+        token['EC'] = ec
+        token['RRC'] = rrc
+        token['SND_SEQ'] = struct.pack('>Q', sequenceNumber & 0xFFFFFFFFFFFFFFFF)
+        return token
+
     def GSS_GetMIC(self, sessionKey, data, sequenceNumber, direction = 'init'):
         token = self.MIC()
 
@@ -339,12 +396,47 @@ class GSSAPI_AES():
 
         checkSumProfile = self.checkSumProfile()
 
-        token['Flags'] = 4
-        token['SND_SEQ'] = struct.pack('>Q',sequenceNumber)
-        token['SGN_CKSUM'] = checkSumProfile.checksum(sessionKey, KG_USAGE_INITIATOR_SIGN, data + token.getData()[:16])
- 
+        token['Flags'] = self._flags_for(direction, sealed=False)
+        token['SND_SEQ'] = struct.pack('>Q', sequenceNumber & 0xFFFFFFFFFFFFFFFF)
+        token['SGN_CKSUM'] = checkSumProfile.checksum(
+            sessionKey, self._sign_usage(direction), data + token.getData()[:16])
+
         return token.getData()
-   
+
+    def GSS_VerifyMIC(self, sessionKey, data, micToken, sequenceNumber=None, direction = 'init'):
+        """Verify a received MIC token.  ``direction`` is the local role, so the
+        token is expected to come from the peer.  Raises GSSAPITokenError on
+        structural problems and InvalidChecksum on a bad checksum."""
+        sender = self._peer(direction)
+        if len(micToken) < len(self.MIC()):
+            raise GSSAPITokenError('MIC token shorter than %d bytes' % len(self.MIC()),
+                                   offset=0, field='MIC')
+        token = self.MIC(micToken)
+        if token['TOK_ID'] != self._MIC_TOK_ID:
+            raise GSSAPITokenError('bad MIC TOK_ID 0x%04x' % token['TOK_ID'],
+                                   offset=0, field='TOK_ID')
+        flags = token['Flags']
+        if flags & 0xF8:
+            raise GSSAPITokenError('reserved MIC flag bits set', offset=2, field='Flags')
+        if flags & self._FLAG_SEALED:
+            raise GSSAPITokenError('MIC token must not set the sealed flag',
+                                   offset=2, field='Flags')
+        if bool(flags & self._FLAG_SENDER_IS_ACCEPTOR) != (sender == 'accept'):
+            raise GSSAPITokenError('MIC direction mismatch', offset=2, field='Flags')
+        if token['Filler0'] != 0xff or token['Filler'] != 0xffffffff:
+            raise GSSAPITokenError('bad MIC filler', offset=3, field='Filler')
+        seq = struct.unpack('>Q', token['SND_SEQ'])[0]
+        if sequenceNumber is not None and seq != (sequenceNumber & 0xFFFFFFFFFFFFFFFF):
+            raise GSSAPITokenError('MIC sequence number mismatch', offset=8, field='SND_SEQ')
+
+        pad = _calculateMICPad(data)
+        data += pad
+        # The checksum covers the data followed by the first 16 bytes of the
+        # MIC token (everything except the trailing SGN_CKSUM).
+        self.checkSumProfile().verify(sessionKey, self._sign_usage(sender),
+                                      data + micToken[:16], token['SGN_CKSUM'])
+        return seq
+
     def rotate(self, data, numBytes):
         numBytes %= len(data)
         left = len(data) - numBytes
@@ -355,32 +447,114 @@ class GSSAPI_AES():
         numBytes %= len(data)
         result = data[numBytes:] + data[:numBytes]
         return result
-        
-    def GSS_Wrap(self, sessionKey, data, sequenceNumber, direction = 'init', encrypt=True):
-        token = self.WRAP()
 
+    # -- receiving ----------------------------------------------------------
+    def _parse_wrap_header(self, header, expect_sender, expect_sealed):
+        if len(header) < len(self.WRAP()):
+            raise GSSAPITokenError('wrap token shorter than 16-byte header',
+                                   offset=0, field='header')
+        token = self.WRAP(header)
+        if token['TOK_ID'] != self._WRAP_TOK_ID:
+            raise GSSAPITokenError('bad wrap TOK_ID 0x%04x' % token['TOK_ID'],
+                                   offset=0, field='TOK_ID')
+        flags = token['Flags']
+        if flags & 0xF8:
+            raise GSSAPITokenError('reserved wrap flag bits set', offset=2, field='Flags')
+        if token['Filler'] != self._WRAP_FILLER:
+            raise GSSAPITokenError('bad wrap filler 0x%02x' % token['Filler'],
+                                   offset=3, field='Filler')
+        sealed = bool(flags & self._FLAG_SEALED)
+        if expect_sealed is not None and sealed != expect_sealed:
+            raise GSSAPITokenError('sealed flag mismatch', offset=2, field='Flags')
+        if bool(flags & self._FLAG_SENDER_IS_ACCEPTOR) != (expect_sender == 'accept'):
+            raise GSSAPITokenError('wrap direction mismatch', offset=2, field='Flags')
+        ec = token['EC']
+        rrc = token['RRC']
+        if sealed:
+            if rrc != self._SEALED_RRC:
+                raise GSSAPITokenError('sealed token must carry RRC=%d' % self._SEALED_RRC,
+                                       offset=6, field='RRC')
+            if ec > 15:
+                raise GSSAPITokenError('EC out of range', offset=4, field='EC')
+        else:
+            if rrc != self._SIGN_ONLY_RRC:
+                raise GSSAPITokenError('sign-only token must carry RRC=%d' % self._SIGN_ONLY_RRC,
+                                       offset=6, field='RRC')
+            if ec != 0:
+                raise GSSAPITokenError('EC must be 0 for a sign-only token',
+                                       offset=4, field='EC')
+        seq = struct.unpack('>Q', token['SND_SEQ'])[0]
+        return token, flags, ec, rrc, seq
+
+    def _unwrap_token(self, sessionKey, token, expect_sender, expect_sealed=None):
+        """Validate and open a contiguous wrap token (16-byte header + body).
+
+        Returns ``(plaintext, sequenceNumber, sealed)``.  Structural problems
+        raise GSSAPITokenError; integrity failures raise InvalidChecksum."""
+        _, flags, ec, rrc, seq = self._parse_wrap_header(token[:16], expect_sender, expect_sealed)
+        sealed = bool(flags & self._FLAG_SEALED)
+        if sealed:
+            rotated = token[len(self.WRAP()):]
+            cipherText = self.unrotate(rotated, rrc + ec)
+            plainText = self.cipherType().decrypt(sessionKey, self._seal_usage(expect_sender),
+                                                  cipherText)
+            if len(plainText) < ec + len(self.WRAP()):
+                raise GSSAPITokenError('sealed token too short for EC padding and inner header',
+                                       offset=0, field='EC')
+            # The decrypted trailer holds the authenticated inner copy of the header.
+            # Cross-check it against the plaintext outer header so a tampered outer
+            # TOK_ID/Flags/EC/SND_SEQ is rejected instead of silently trusted.
+            inner = self.WRAP(plainText[-len(self.WRAP()):])
+            if inner['TOK_ID'] != self._WRAP_TOK_ID or inner['Flags'] != flags or \
+                    inner['EC'] != ec or inner['RRC'] != 0 or \
+                    struct.unpack('>Q', inner['SND_SEQ'])[0] != seq:
+                raise GSSAPITokenError('inner header does not match outer header',
+                                       offset=0, field='inner-header')
+            # Strip exactly EC padding bytes plus the 16-byte inner header so the
+            # rotated trailer is never mistaken for application data.
+            return plainText[:-(ec + len(self.WRAP()))], seq, True
+        body = token[len(self.WRAP()):]
+        if len(body) < self._CHECKSUM_LEN:
+            raise GSSAPITokenError('sign-only token truncated before checksum',
+                                   offset=len(self.WRAP()), field='SGN_CKSUM')
+        checksum, data = body[:self._CHECKSUM_LEN], body[self._CHECKSUM_LEN:]
+        inner = self._build_wrap_header(expect_sender, False, 0, 0, seq)
+        self.checkSumProfile().verify(sessionKey, self._sign_usage(expect_sender),
+                                      data + inner.getData(), checksum)
+        return data, seq, False
+
+    # -- sending -------------------------------------------------------------
+    def GSS_Wrap(self, sessionKey, data, sequenceNumber, direction = 'init', encrypt=True):
         cipher = self.cipherType()
+
+        if not encrypt:
+            # RFC 4121 section 4.2.6.2: integrity-only wrap token.
+            header = self._build_wrap_header(direction, False, 0, 0, sequenceNumber)
+            checkSum = self.checkSumProfile().checksum(
+                sessionKey, self._sign_usage(direction), data + header.getData())
+            header = self._build_wrap_header(direction, False, 0, self._SIGN_ONLY_RRC,
+                                             sequenceNumber)
+            # The plaintext is carried unmodified; the signature is header+checksum.
+            return data, header.getData() + checkSum
 
         # Let's pad the data
         pad = (cipher.blocksize - (len(data) % cipher.blocksize)) & 15
         padStr = b'\xFF' * pad
         data += padStr
 
-        # The RRC field ([RFC4121] section 4.2.5) is 12 if no encryption is requested or 28 if encryption 
-        # is requested. The RRC field is chosen such that all the data can be encrypted in place.
-        rrc = 28
+        # The RRC field ([RFC4121] section 4.2.5) is 12 if no encryption is requested or 28 if
+        # encryption is requested. The RRC field is chosen such that all the data can be
+        # encrypted in place.
+        rrc = self._SEALED_RRC
 
-        token['Flags'] = 6
-        token['EC'] = pad
-        token['RRC'] = 0
-        token['SND_SEQ'] = struct.pack('>Q',sequenceNumber)
+        token = self._build_wrap_header(direction, True, pad, 0, sequenceNumber)
 
-        cipherText = cipher.encrypt(sessionKey, KG_USAGE_INITIATOR_SEAL,  data + token.getData(), None)
+        cipherText = cipher.encrypt(sessionKey, self._seal_usage(direction),
+                                    data + token.getData(), None)
         token['RRC'] = rrc
 
         cipherText = self.rotate(cipherText, token['RRC'] + token['EC'])
 
-        #nn = self.unrotate(cipherText, token['RRC'] + token['EC'])
         ret1 = cipherText[len(self.WRAP()) + token['RRC'] + token['EC']:]
         ret2 = token.getData() + cipherText[:len(self.WRAP()) + token['RRC'] + token['EC']]
 
@@ -389,61 +563,43 @@ class GSSAPI_AES():
     def GSS_Unwrap(self, sessionKey, data, sequenceNumber, direction = 'init', encrypt=True, authData=None):
         from impacket.dcerpc.v5.rpcrt import SEC_TRAILER
 
-        cipher = self.cipherType()
-        token = self.WRAP(authData[len(SEC_TRAILER()):])
-
-        rotated = authData[len(self.WRAP())+len(SEC_TRAILER()):] + data
- 
-        cipherText = self.unrotate(rotated, token['RRC'] + token['EC'])
-        plainText = cipher.decrypt(sessionKey, KG_USAGE_ACCEPTOR_SEAL,  cipherText)
-
-        return plainText[:-(token['EC']+len(self.WRAP()))], None
+        # The DCE/RPC security trailer carries the 16-byte header plus the leading
+        # rotated bytes; ``data`` carries the remainder.  Concatenated they form the
+        # full contiguous wrap token.
+        token = authData[len(SEC_TRAILER()):] + data
+        plainText, _, _ = self._unwrap_token(sessionKey, token, self._peer(direction),
+                                             expect_sealed=encrypt)
+        return plainText, None
 
     def GSS_Wrap_LDAP(self, sessionKey, data, sequenceNumber, direction = 'init', encrypt=True, use_padding=False):
-        token = self.WRAP()
-
         cipher = self.cipherType()
 
         pad = 0
         if use_padding:
-        # Let's pad the data
+            # Let's pad the data
             pad = (cipher.blocksize - (len(data) % cipher.blocksize)) & 15
             padStr = b'\xFF' * pad
             data += padStr
 
-        # The RRC field ([RFC4121] section 4.2.5) is 12 if no encryption is requested or 28 if encryption 
-        # is requested. The RRC field is chosen such that all the data can be encrypted in place.
-        rrc = 28
+        rrc = self._SEALED_RRC
 
-        token['Flags'] = 6
-        token['EC'] = pad
-        token['RRC'] = 0
-        token['SND_SEQ'] = struct.pack('>Q',sequenceNumber)
+        token = self._build_wrap_header(direction, True, pad, 0, sequenceNumber)
 
-        cipherText = cipher.encrypt(sessionKey, KG_USAGE_INITIATOR_SEAL,  data + token.getData(), None)
+        cipherText = cipher.encrypt(sessionKey, self._seal_usage(direction),
+                                    data + token.getData(), None)
         token['RRC'] = rrc
 
         cipherText = self.rotate(cipherText, token['RRC'] + token['EC'])
 
-        #nn = self.unrotate(cipherText, token['RRC'] + token['EC'])
-        # ret1 = cipherText[len(self.WRAP()) + token['RRC'] + token['EC']:]
-        # ret2 = token.getData() + cipherText[:len(self.WRAP()) + token['RRC'] + token['EC']]
         ret1 = cipherText
         ret2 = token.getData()
 
         return ret1, ret2
 
     def GSS_Unwrap_LDAP(self, sessionKey, data, sequenceNumber, direction = 'init'):
-
-        cipher = self.cipherType()
-        token = self.WRAP(data[:16])
-
-        rotated = data[16:]
- 
-        cipherText = self.unrotate(rotated, token['RRC'] + token['EC'])
-        plainText = cipher.decrypt(sessionKey, KG_USAGE_ACCEPTOR_SEAL,  cipherText)
-
-        return plainText[:-(token['EC']+ 16)], None
+        plainText, _, _ = self._unwrap_token(sessionKey, data, self._peer(direction),
+                                             expect_sealed=True)
+        return plainText, None
 
 class GSSAPI_AES256(GSSAPI_AES):
     checkSumProfile = crypto._SHA1AES256
