@@ -215,6 +215,8 @@ class AUTHZR_TOKEN_GROUPS(NDRSTRUCT):
         # omits it in observed NDR32 replies.
         if self._isNDR64:
             offset += (8 - (offset % 8)) % 8
+            if self.limits is not None:
+                self._checkBounds(data, offset, 8, 'MaximumCount', '<Q')
             maxCount = unpack_from('<Q', data, offset)[0]
             offset += 8
         else:
@@ -228,9 +230,15 @@ class AUTHZR_TOKEN_GROUPS(NDRSTRUCT):
         if entryAlignment > 0:
             offset += (entryAlignment - (offset % entryAlignment)) % entryAlignment
 
+        if self.limits is not None:
+            # Charge the element budget before the loop, so an attacker-controlled
+            # GroupCount fails against the shared budget before any entry object
+            # is allocated.
+            self.limits.chargeArray(self._structureName(), arrayCount)
+
         self.fields['Groups'] = []
         for _ in range(arrayCount):
-            entry = AUTHZR_SID_AND_ATTRIBUTES(isNDR64=self._isNDR64)
+            entry = self._newNDR(AUTHZR_SID_AND_ATTRIBUTES)
             offset += entry.fromString(data, offset)
             self.fields['Groups'].append(entry)
 

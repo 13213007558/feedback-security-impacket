@@ -20,6 +20,7 @@
 #
 import random
 import inspect
+import threading
 from struct import pack, unpack_from, calcsize
 from six import with_metaclass, PY3
 from binascii import hexlify
@@ -34,6 +35,224 @@ from impacket.uuid import uuidtup_to_bin
 # Where necessary, an alignment gap, consisting of octets of unspecified value, *precedes* the
 # representation of a primitive. The gap is of the smallest size sufficient to align the primitive
 
+
+class NDRLimitError(Exception):
+    """
+    Raised when an NDR stream violates the budgets of an active :class:`NDRLimits`
+    instance. It is never raised when no limits are configured, so callers that do
+    not opt in keep the historical (unrestricted) decoding behavior.
+
+    ``budget`` names the exhausted budget (``max_array_elements``,
+    ``max_octets``, ``max_referents`` or ``max_depth``), ``structure`` is the NDR
+    type being decoded and ``path`` is the chain of containing structures.
+    """
+
+    def __init__(self, budget, structure, detail, path=None):
+        self.budget = budget
+        self.structure = structure
+        self.path = tuple(path or ())
+        location = '/'.join(self.path + (structure,))
+        self.message = 'NDR %s budget exceeded while decoding %s: %s' % (budget, location, detail)
+        super(NDRLimitError, self).__init__(self.message)
+
+
+# Default budgets for :class:`NDRLimits`. They are intentionally generous: the
+# goal is to stop absurd, attacker-controlled counts long before they exhaust
+# memory while leaving every realistic RPC payload untouched.
+NDR_DEFAULT_MAX_ARRAY_ELEMENTS = 1 * 1024 * 1024
+NDR_DEFAULT_MAX_OCTETS = 64 * 1024 * 1024
+NDR_DEFAULT_MAX_REFERENTS = 64 * 1024
+NDR_DEFAULT_MAX_DEPTH = 128
+
+
+class NDRLimits(object):
+    """
+    Shared decoding budgets for a whole NDR deserialization, including every
+    nested structure, conformant/varying array and deferred referent.
+
+    Budgets are *shared*: elements, octets, referents and nesting depth consumed
+    anywhere in the stream count against the same instance, which is what makes
+    a single extravagant MaximumCount/ActualCount fail before the corresponding
+    list (and, for NDR items, the per-item objects) is allocated.
+
+    Instances are thread safe and reusable through the :meth:`reset` method.
+    Pass one to an NDR constructor (``MyCall(data, limits=limits)``) or install a
+    process-wide default with :func:`setDefaultLimits` / :func:`getDefaultLimits`.
+
+    Opt-in example::
+
+        from impacket.dcerpc.v5.ndr import NDRLimits, NDRLimitError
+
+        limits = NDRLimits(max_array_elements=100_000,
+                           max_octets=8 * 1024 * 1024,
+                           max_referents=10_000,
+                           max_depth=64)
+        try:
+            response = MyRpcResponse(data, limits=limits)
+        except NDRLimitError as error:
+            # error.budget names the exhausted budget, error.path the structure
+            # chain that led to it.
+            reject_stub(error.message)
+
+    Without an explicit ``limits`` argument (and with no process-wide default
+    installed) decoding is byte-for-byte identical to the historical,
+    unrestricted behavior, including its lenient handling of truncated streams.
+    """
+
+    def __init__(self, max_array_elements=NDR_DEFAULT_MAX_ARRAY_ELEMENTS,
+                 max_octets=NDR_DEFAULT_MAX_OCTETS,
+                 max_referents=NDR_DEFAULT_MAX_REFERENTS,
+                 max_depth=NDR_DEFAULT_MAX_DEPTH):
+        for name, value in (('max_array_elements', max_array_elements),
+                            ('max_octets', max_octets),
+                            ('max_referents', max_referents),
+                            ('max_depth', max_depth)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError('NDR limit %r must be a non-negative integer, got %r' % (name, value))
+        self.max_array_elements = max_array_elements
+        self.max_octets = max_octets
+        self.max_referents = max_referents
+        self.max_depth = max_depth
+        self._lock = threading.RLock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.array_elements = 0
+            self.octets = 0
+            self.referents = 0
+            self.depth = 0
+            self.peak_depth = 0
+            # ReferentIDs already seen: shared referents must not be decoded (and
+            # charged) twice, NULL (id 0) is never registered.
+            self._referent_ids = set()
+            # Stack of structure names, used for human readable error locations.
+            self._path = []
+        return self
+
+    # --- location tracking -------------------------------------------------
+    def enter(self, structure):
+        self._path.append(structure)
+
+    def leave(self, structure):
+        # Pop the most recent matching frame, not the first: recursive or
+        # repeated structure names can legitimately appear more than once.
+        for index in range(len(self._path) - 1, -1, -1):
+            if self._path[index] == structure:
+                del self._path[index]
+                return
+        if self._path:
+            self._path.pop()
+
+    @property
+    def path(self):
+        return tuple(self._path)
+
+    def _fail(self, budget, structure, detail):
+        raise NDRLimitError(budget, structure, detail, self._path)
+
+    # --- depth -------------------------------------------------------------
+    def enterStructure(self, structure):
+        with self._lock:
+            if self.depth >= self.max_depth:
+                self._fail('max_depth', structure,
+                           'nesting depth %d reached the limit of %d' % (self.depth, self.max_depth))
+            self.depth += 1
+            if self.depth > self.peak_depth:
+                self.peak_depth = self.depth
+
+    def leaveStructure(self):
+        with self._lock:
+            if self.depth > 0:
+                self.depth -= 1
+
+    # --- arrays ------------------------------------------------------------
+    def chargeArray(self, structure, count, item_size=1):
+        """
+        Reserve ``count`` elements (and ``count * item_size`` octets) before the
+        elements are materialized. Raises :class:`NDRLimitError` on overflow so
+        no large allocation takes place.
+        """
+        with self._lock:
+            if count < 0:
+                self._fail('max_array_elements', structure,
+                           'negative element count %d' % count)
+            new_elements = self.array_elements + count
+            if new_elements > self.max_array_elements:
+                self._fail('max_array_elements', structure,
+                           '%d new elements would raise the total to %d, over the limit of %d'
+                           % (count, new_elements, self.max_array_elements))
+            extra_octets = count * item_size
+            if item_size and self.octets + extra_octets > self.max_octets:
+                self._fail('max_octets', structure,
+                           '%d array octets would raise the total to %d, over the limit of %d'
+                           % (extra_octets, self.octets + extra_octets, self.max_octets))
+            self.array_elements = new_elements
+            self.octets += extra_octets
+
+    # --- generic octet accounting -----------------------------------------
+    def chargeOctets(self, structure, amount):
+        with self._lock:
+            if amount < 0:
+                self._fail('max_octets', structure, 'negative octet amount %d' % amount)
+            if self.octets + amount > self.max_octets:
+                self._fail('max_octets', structure,
+                           '%d octets would raise the total to %d, over the limit of %d'
+                           % (amount, self.octets + amount, self.max_octets))
+            self.octets += amount
+
+    # --- referents ---------------------------------------------------------
+    def registerReferent(self, structure, referent_id):
+        """
+        Account for a non-NULL pointer occurrence.
+
+        Every occurrence is charged against the referent budget, because the
+        historical decoder materializes a referent body for each pointer even
+        when two pointers carry the same ReferentID (an aliased/shared
+        referent). Repeated IDs are remembered in :attr:`seen_referent_ids` so
+        callers can observe sharing, but decoding is deliberately not changed:
+        the limit is additive and opt-in only.
+        """
+        with self._lock:
+            shared = referent_id in self._referent_ids
+            if self.referents >= self.max_referents:
+                self._fail('max_referents', structure,
+                           'referent 0x%x would exceed the limit of %d referents'
+                           % (referent_id, self.max_referents))
+            self.referents += 1
+            self._referent_ids.add(referent_id)
+            return not shared
+
+    @property
+    def seen_referent_ids(self):
+        with self._lock:
+            return frozenset(self._referent_ids)
+
+
+_defaultLimitsLock = threading.RLock()
+_defaultLimits = None
+
+# Sentinel distinguishing "limits not supplied" from an explicit limits=None,
+# which must always mean "decode this object without limits".
+_UNSET = object()
+
+
+def setDefaultLimits(limits):
+    """
+    Install a process-wide :class:`NDRLimits` applied to every NDR decode that
+    does not receive an explicit ``limits`` argument. Pass ``None`` to restore
+    the default, fully backward compatible, unrestricted behavior.
+    """
+    global _defaultLimits
+    if limits is not None and not isinstance(limits, NDRLimits):
+        raise TypeError('limits must be an NDRLimits instance or None')
+    with _defaultLimitsLock:
+        _defaultLimits = limits
+
+
+def getDefaultLimits():
+    return _defaultLimits
+
 class NDR(object):
     """
     This will be the base class for all DCERPC NDR Types and represents a NDR Primitive Type
@@ -47,10 +266,13 @@ class NDR(object):
     item           = None
     _isNDR64       = False
 
-    def __init__(self, data = None, isNDR64 = False):
+    def __init__(self, data = None, isNDR64 = False, limits = _UNSET):
         object.__init__(self)
         self._isNDR64 = isNDR64
         self.fields = {}
+        # Explicit limits win; otherwise a process-wide default may apply.
+        # ``None`` means unrestricted decoding, preserving the legacy behavior.
+        self.limits = getDefaultLimits() if limits is _UNSET else limits
 
         if isNDR64 is True:
             if self.commonHdr64 != ():
@@ -62,10 +284,10 @@ class NDR(object):
 
         for fieldName, fieldTypeOrClass in self.commonHdr+self.structure+self.referent:
             if self.isNDR(fieldTypeOrClass):
-               self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64)
+               self.fields[fieldName] = self._newNDR(fieldTypeOrClass)
             elif fieldTypeOrClass == ':':
                self.fields[fieldName] = b''
-            elif len(fieldTypeOrClass.split('=')) == 2: 
+            elif len(fieldTypeOrClass.split('=')) == 2:
                try:
                    self.fields[fieldName] = eval(fieldTypeOrClass.split('=')[1])
                except:
@@ -76,7 +298,31 @@ class NDR(object):
         if data is not None:
             self.fromString(data)
 
-    def changeTransferSyntax(self, newSyntax): 
+    def getLimits(self):
+        """
+        Return the :class:`NDRLimits` enforced while decoding this object, or
+        ``None`` when decoding is unrestricted.
+        """
+        return self.limits
+
+    def _structureName(self):
+        return self.__class__.__name__
+
+    def _checkBounds(self, data, offset, size, fieldName, fieldTypeOrClass):
+        """
+        Guard every primitive read: with limits enabled a truncated stream must
+        fail loudly instead of being silently skipped or filled with defaults.
+        Returns silently when no limits are active.
+        """
+        if self.limits is None or size <= 0:
+            return
+        available = len(data) - offset
+        if size > available:
+            self.limits._fail('max_octets', self._structureName(),
+                              'field %r (%s) needs %d octets but only %d remain'
+                              % (fieldName, fieldTypeOrClass, size, max(available, 0)))
+
+    def changeTransferSyntax(self, newSyntax):
         NDR64Syntax = uuidtup_to_bin(('71710533-BEBA-4937-8319-B5DBEF9CCC36', '1.0'))
         if newSyntax == NDR64Syntax:
             if self._isNDR64 is False:
@@ -99,12 +345,12 @@ class NDR(object):
                     if isinstance(self.fields[fieldName], NDR):
                         if fieldTypeOrClass != self.fields[fieldName].__class__ and isinstance(self.fields[fieldName], NDRPOINTERNULL) is False:
                             backupData = self[fieldName]
-                            self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64)
+                            self.fields[fieldName] = self._newNDR(fieldTypeOrClass)
                             if 'Data' in self.fields[fieldName].fields:
                                 self.fields[fieldName].fields['Data'] = backupData
                             else:
                                 self[fieldName] = backupData
-  
+
         else:
             if self._isNDR64 is True:
                 # Ok, nothing for now
@@ -158,6 +404,50 @@ class NDR(object):
             if issubclass(myClass, NDR):
                 return True
         return False
+
+    def _newNDR(self, fieldTypeOrClass, topLevel = None):
+        """
+        Instantiate a sibling NDR type while sharing the active decoding
+        limits. ``limits`` is passed as a keyword only to constructors that
+        declare it; subclasses across the library keep their historical
+        ``(data, isNDR64)`` signatures and receive the limits through the
+        shared attribute instead, which keeps the opt-in feature backward
+        compatible.
+        """
+        kwargs = {'isNDR64': self._isNDR64}
+        if topLevel is not None:
+            kwargs['topLevel'] = topLevel
+        try:
+            instance = fieldTypeOrClass(limits=self.limits, **kwargs)
+        except TypeError:
+            instance = fieldTypeOrClass(**kwargs)
+            if self.limits is not None:
+                # Propagate to fields the subclass constructor built without limits.
+                instance._adoptLimits(self.limits)
+        return instance
+
+    def _adoptLimits(self, limits):
+        """Recursively share a limits instance with already-constructed fields."""
+        self.limits = limits
+        for child in self.fields.values():
+            if isinstance(child, NDR):
+                child._adoptLimits(limits)
+
+    @classmethod
+    def withLimits(cls, limits, data=None, isNDR64=False, **kwargs):
+        """
+        Construct any NDR type (including library subclasses whose own
+        ``__init__`` only accepts ``(data, isNDR64)``) while enforcing the
+        supplied :class:`NDRLimits`. The limits are shared recursively with
+        every field so the whole decode runs against one budget.
+        """
+        try:
+            return cls(data=data, isNDR64=isNDR64, limits=limits, **kwargs)
+        except TypeError:
+            instance = cls(data=data, isNDR64=isNDR64, **kwargs)
+            if limits is not None:
+                instance._adoptLimits(limits)
+            return instance
 
     def dumpRaw(self, msg = None, indent = 0):
         if msg is None:
@@ -248,24 +538,32 @@ class NDR(object):
 
     def fromString(self, data, offset=0):
         offset0 = offset
-        for fieldName, fieldTypeOrClass in self.commonHdr+self.structure:
-            try:
-                # Alignment of Primitive Types
+        if self.limits is not None:
+            self.limits.enter(self._structureName())
+            self.limits.enterStructure(self._structureName())
+        try:
+            for fieldName, fieldTypeOrClass in self.commonHdr+self.structure:
+                try:
+                    # Alignment of Primitive Types
 
-                # NDR enforces NDR alignment of primitive data; that is, any primitive of size n
-                # octets is aligned at a octet stream index that is a multiple of n.
-                # (In this version of NDR, n is one of {1, 2, 4, 8}.) An octet stream index indicates
-                # the number of an octet in an octet stream when octets are numbered, beginning with 0,
-                # from the first octet in the stream. Where necessary, an alignment gap, consisting of
-                # octets of unspecified value, precedes the representation of a primitive. The gap is
-                # of the smallest size sufficient to align the primitive.
-                offset += self.calculatePad(fieldTypeOrClass, offset)
+                    # NDR enforces NDR alignment of primitive data; that is, any primitive of size n
+                    # octets is aligned at a octet stream index that is a multiple of n.
+                    # (In this version of NDR, n is one of {1, 2, 4, 8}.) An octet stream index indicates
+                    # the number of an octet in an octet stream when octets are numbered, beginning with 0,
+                    # from the first octet in the stream. Where necessary, an alignment gap, consisting of
+                    # octets of unspecified value, precedes the representation of a primitive. The gap is
+                    # of the smallest size sufficient to align the primitive.
+                    offset += self.calculatePad(fieldTypeOrClass, offset)
 
-                offset += self.unpack(fieldName, fieldTypeOrClass, data, offset)
-            except Exception as e:
-                LOG.error(str(e))
-                LOG.error("Error unpacking field '%s | %s | %r'" % (fieldName, fieldTypeOrClass, data[offset:offset+256]))
-                raise
+                    offset += self.unpack(fieldName, fieldTypeOrClass, data, offset)
+                except Exception as e:
+                    LOG.error(str(e))
+                    LOG.error("Error unpacking field '%s | %s | %r'" % (fieldName, fieldTypeOrClass, data[offset:offset+256]))
+                    raise
+        finally:
+            if self.limits is not None:
+                self.limits.leaveStructure()
+                self.limits.leave(self._structureName())
         return offset - offset0
 
     def pack(self, fieldName, fieldTypeOrClass, soFar = 0):
@@ -313,13 +611,21 @@ class NDR(object):
                 return self.fields[fieldName].fromString(data, offset)
             else:
                 dataLen = self.getDataLen(data, offset)
-                self.fields[fieldName] =  data[offset:offset+dataLen]
+                if self.limits is not None and dataLen < 0:
+                    self._checkBounds(data, offset, 1, fieldName, fieldTypeOrClass)
+                if self.limits is not None and dataLen > 0:
+                    self.limits.chargeOctets(self._structureName(), dataLen)
+                self.fields[fieldName] = data[offset:offset+dataLen]
                 return dataLen
 
         # struct like specifier
+        size = calcsize(fieldTypeOrClass)
+        if self.limits is not None:
+            self._checkBounds(data, offset, size, fieldName, fieldTypeOrClass)
+            self.limits.chargeOctets(self._structureName(), size)
         self.fields[fieldName] = unpack_from(fieldTypeOrClass, data, offset)[0]
 
-        return calcsize(fieldTypeOrClass)
+        return size
 
     def calcPackSize(self, fieldTypeOrClass, data):
         if isinstance(fieldTypeOrClass, str) is False:
@@ -595,9 +901,13 @@ class NDRCONSTRUCTEDTYPE(NDR):
 
         if isinstance(self.fields[fieldName], NDRUniConformantArray):
             # Array Size is at the very beginning
+            if self.limits is not None:
+                self._checkBounds(data, offset, arrayItemSize, fieldName + '.MaximumCount', arrayUnPackStr)
             arraySize = unpack_from(arrayUnPackStr, data, offset)[0]
         elif isinstance(self.fields[fieldName], NDRUniConformantVaryingArray):
             # NDRUniConformantVaryingArray Array
+            if self.limits is not None:
+                self._checkBounds(data, offset, arrayItemSize * 3, fieldName, arrayUnPackStr)
             # Unpack the Maximum Count
             maximumCount = unpack_from(arrayUnPackStr, data, offset)[0]
             # Let's store the Maximum Count for later use
@@ -606,16 +916,24 @@ class NDRCONSTRUCTEDTYPE(NDR):
             arraySize = unpack_from(arrayUnPackStr, data, offset+arrayItemSize*2)[0]
         else:
             # NDRUniVaryingArray Array
+            if self.limits is not None:
+                self._checkBounds(data, offset, arrayItemSize * 2, fieldName, arrayUnPackStr)
             arraySize = unpack_from(arrayUnPackStr, data, offset+arrayItemSize)[0]
 
         return arraySize, arrayItemSize+pad
 
     def fromStringReferents(self, data, offset=0):
         offset0 = offset
-        for fieldName, fieldTypeOrClass in self.commonHdr+self.structure:
-            if isinstance(self.fields[fieldName], NDRCONSTRUCTEDTYPE):
-                offset += self.fields[fieldName].fromStringReferents(data, offset)
-                offset += self.fields[fieldName].fromStringReferent(data, offset)
+        if self.limits is not None:
+            self.limits.enter(self._structureName())
+        try:
+            for fieldName, fieldTypeOrClass in self.commonHdr+self.structure:
+                if isinstance(self.fields[fieldName], NDRCONSTRUCTEDTYPE):
+                    offset += self.fields[fieldName].fromStringReferents(data, offset)
+                    offset += self.fields[fieldName].fromStringReferent(data, offset)
+        finally:
+            if self.limits is not None:
+                self.limits.leave(self._structureName())
         return offset - offset0
 
     def fromStringReferent(self, data, offset=0):
@@ -629,30 +947,38 @@ class NDRCONSTRUCTEDTYPE(NDR):
                 # NULL Pointer, there's no referent for it
                 return 0
 
-        for fieldName, fieldTypeOrClass in self.referent:
-            try:
-                if isinstance(self.fields[fieldName], NDRUniConformantArray) or isinstance(self.fields[fieldName], NDRUniConformantVaryingArray):
-                    # Get the array size
-                    arraySize, advanceStream = self.getArraySize(fieldName, data, offset)
-                    offset += advanceStream
+        if self.limits is not None:
+            self.limits.enter(self._structureName())
+            self.limits.enterStructure(self._structureName())
+        try:
+            for fieldName, fieldTypeOrClass in self.referent:
+                try:
+                    if isinstance(self.fields[fieldName], NDRUniConformantArray) or isinstance(self.fields[fieldName], NDRUniConformantVaryingArray):
+                        # Get the array size
+                        arraySize, advanceStream = self.getArraySize(fieldName, data, offset)
+                        offset += advanceStream
 
-                    # Let's tell the array how many items are available
-                    self.fields[fieldName].setArraySize(arraySize)
-                    size = self.fields[fieldName].fromString(data, offset)
-                else:
-                    # ToDo: Align only if not NDR
-                    offset += self.calculatePad(fieldTypeOrClass, offset)
+                        # Let's tell the array how many items are available
+                        self.fields[fieldName].setArraySize(arraySize)
+                        size = self.fields[fieldName].fromString(data, offset)
+                    else:
+                        # ToDo: Align only if not NDR
+                        offset += self.calculatePad(fieldTypeOrClass, offset)
 
-                    size = self.unpack(fieldName, fieldTypeOrClass, data, offset)
+                        size = self.unpack(fieldName, fieldTypeOrClass, data, offset)
 
-                if isinstance(self.fields[fieldName], NDRCONSTRUCTEDTYPE):
-                    size += self.fields[fieldName].fromStringReferents(data, offset+size)
-                    size += self.fields[fieldName].fromStringReferent(data, offset+size)
-                offset += size
-            except Exception as e:
-                LOG.error(str(e))
-                LOG.error("Error unpacking field '%s | %s | %r'" % (fieldName, fieldTypeOrClass, data[offset:offset+256]))
-                raise
+                    if isinstance(self.fields[fieldName], NDRCONSTRUCTEDTYPE):
+                        size += self.fields[fieldName].fromStringReferents(data, offset+size)
+                        size += self.fields[fieldName].fromStringReferent(data, offset+size)
+                    offset += size
+                except Exception as e:
+                    LOG.error(str(e))
+                    LOG.error("Error unpacking field '%s | %s | %r'" % (fieldName, fieldTypeOrClass, data[offset:offset+256]))
+                    raise
+        finally:
+            if self.limits is not None:
+                self.limits.leaveStructure()
+                self.limits.leave(self._structureName())
 
         return offset-offset0
 
@@ -748,7 +1074,7 @@ class NDRArray(NDRCONSTRUCTEDTYPE):
             if self.isNDR(self.item):
                 item = ':'
                 dataClass = self.item
-                self.fields['_tmpItem'] = dataClass(isNDR64=self._isNDR64)
+                self.fields['_tmpItem'] = self._newNDR(dataClass)
             else:
                 item = self.item
                 dataClass = None
@@ -790,7 +1116,11 @@ class NDRArray(NDRCONSTRUCTEDTYPE):
                 if self.isNDR(fieldTypeOrClass) is False:
                     # If the item is not NDR (e.g. ('MaximumCount', '<L=len(Data)'))
                     # we have to align it
-                    offset += self.calculatePad(fieldTypeOrClass, offset)
+                    pad = self.calculatePad(fieldTypeOrClass, offset)
+                    offset += pad
+                    if self.limits is not None and not fieldTypeOrClass.startswith('*'):
+                        self._checkBounds(data, offset, calcsize(fieldTypeOrClass.split('=')[0]),
+                                          fieldName, fieldTypeOrClass)
 
                 size = self.unpack(fieldName, fieldTypeOrClass, data, offset)
                 offset += size
@@ -818,31 +1148,55 @@ class NDRArray(NDRCONSTRUCTEDTYPE):
             else:
                 numItems = self[two[1]]
 
+            # Validate the wire counts against each other and the remaining data
+            # before anything is allocated. When limits are enabled an invalid or
+            # truncated array raises NDRLimitError instead of being silently
+            # shortened.
+            self._validateArrayCounts(fieldName, numItems)
+
             # The item type is determined by self.item
             if self.isNDR(self.item):
                 item = ':'
                 dataClassOrCode = self.item
-                self.fields['_tmpItem'] = dataClassOrCode(isNDR64=self._isNDR64)
+                self.fields['_tmpItem'] = self._newNDR(dataClassOrCode)
             else:
                 item = self.item
                 dataClassOrCode = None
                 self.fields['_tmpItem'] = item
+                if self.limits is not None:
+                    # Reserve the whole element budget up front: the charge (and
+                    # therefore the failure) happens before the list is built.
+                    self.limits.chargeArray(self._structureName(), numItems, calcsize(item))
 
             nsofar = 0
+            itemsRead = 0
             while numItems and soFarItems < len(data) - offset:
                 pad = self.calculatePad(self.item, soFarItems+offset)
                 if pad > 0:
                     soFarItems +=pad
                 if dataClassOrCode is None:
                     nsofar = soFarItems + calcsize(item)
+                    if self.limits is not None:
+                        self._checkBounds(data, offset + soFarItems, calcsize(item), fieldName, item)
                     answer.append(unpack_from(item, data, offset+soFarItems)[0])
                 else:
-                    itemn = dataClassOrCode(isNDR64=self._isNDR64)
+                    if self.limits is not None:
+                        # Charge before constructing each object, so an absurd
+                        # count fails on the budget check rather than by
+                        # exhausting memory.
+                        self.limits.chargeArray(self._structureName(), 1)
+                    itemn = self._newNDR(dataClassOrCode)
                     size = itemn.fromString(data, offset+soFarItems)
                     answer.append(itemn)
                     nsofar += size + pad
                 numItems -= 1
+                itemsRead += 1
                 soFarItems = nsofar
+
+            if self.limits is not None and numItems > 0:
+                self.limits._fail('max_octets', self._structureName(),
+                                  'array %r is truncated: %d of %d elements missing from the stream'
+                                  % (fieldName, numItems, numItems + itemsRead))
 
             if dataClassOrCode is not None and isinstance(dataClassOrCode(), NDRCONSTRUCTEDTYPE):
                 # We gotta go over again, asking for the referents
@@ -863,6 +1217,65 @@ class NDRArray(NDRCONSTRUCTEDTYPE):
         else:
             return NDRCONSTRUCTEDTYPE.unpack(self, fieldName, fieldTypeOrClass, data, offset)
 
+    def _validateArrayCounts(self, fieldName, numItems):
+        """
+        Enforce the relationships between MaximumCount, Offset and ActualCount
+        mandated by [C706]/MS-RPCE:
+
+        * MaximumCount must be positive for a conformant dimension;
+        * Offset + ActualCount must not exceed MaximumCount;
+        * ActualCount must be non-negative.
+
+        Checks only run when limits are configured, keeping the legacy decoder
+        byte-for-byte compatible.
+        """
+        if self.limits is None:
+            return
+
+        maximumCount = self.fields.get('MaximumCount')
+        actualCount = self.fields.get('ActualCount')
+        offsetCount = self.fields.get('Offset')
+
+        if isinstance(self, (NDRUniConformantArray, NDRUniConformantVaryingArray)):
+            if not isinstance(maximumCount, int) or maximumCount is None or maximumCount < 0:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r has invalid MaximumCount %r' % (fieldName, maximumCount))
+            # MaximumCount == 0 is a legal, empty conformant array.
+            if maximumCount == 0:
+                return
+
+        if isinstance(self, NDRUniConformantVaryingArray):
+            if actualCount is None or actualCount < 0:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r has invalid ActualCount %r' % (fieldName, actualCount))
+            if offsetCount is None or offsetCount < 0:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r has invalid Offset %r' % (fieldName, offsetCount))
+            if maximumCount is not None and offsetCount + actualCount > maximumCount:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r: Offset(%d) + ActualCount(%d) exceeds MaximumCount(%d)'
+                                  % (fieldName, offsetCount, actualCount, maximumCount))
+            if numItems != actualCount:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r: element count %d does not match ActualCount %d'
+                                  % (fieldName, numItems, actualCount))
+        elif isinstance(self, NDRUniVaryingArray):
+            if actualCount is None or actualCount < 0:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r has invalid ActualCount %r' % (fieldName, actualCount))
+            if offsetCount is None or offsetCount < 0:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r has invalid Offset %r' % (fieldName, offsetCount))
+            if numItems != actualCount:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r: element count %d does not match ActualCount %d'
+                                  % (fieldName, numItems, actualCount))
+        elif isinstance(self, NDRUniConformantArray):
+            if numItems != maximumCount:
+                self.limits._fail('max_array_elements', self._structureName(),
+                                  'array %r: element count %d does not match MaximumCount %d'
+                                  % (fieldName, numItems, maximumCount))
+
 class NDRUniFixedArray(NDRArray):
     structure = (
         ('Data',':'),
@@ -881,8 +1294,8 @@ class NDRUniConformantArray(NDRArray):
         ('Data', '*MaximumCount'),
     )
 
-    def __init__(self, data = None, isNDR64 = False):
-        NDRArray.__init__(self, data, isNDR64)
+    def __init__(self, data = None, isNDR64 = False, limits = _UNSET):
+        NDRArray.__init__(self, data, isNDR64, limits=limits)
         # Let's store the hidden MaximumCount field
         self.fields['MaximumCount'] = 0
 
@@ -927,8 +1340,8 @@ class NDRUniConformantVaryingArray(NDRArray):
         ('Data','*ActualCount'),
     )
 
-    def __init__(self, data = None, isNDR64 = False):
-        NDRArray.__init__(self, data, isNDR64)
+    def __init__(self, data = None, isNDR64 = False, limits = _UNSET):
+        NDRArray.__init__(self, data, isNDR64, limits=limits)
         # Let's store the hidden MaximumCount field
         self.fields['MaximumCount'] = 0
 
@@ -1091,17 +1504,30 @@ class NDRSTRUCT(NDRCONSTRUCTEDTYPE):
 
     def fromString(self, data, offset = 0 ):
         offset0 = offset
+        # NDRPOINTER.fromString drives the parse itself and handles the
+        # referent accounting, so only plain structures enter/leave here.
+        if self.limits is not None and not isinstance(self, NDRPOINTER):
+            self.limits.enter(self._structureName())
+            self.limits.enterStructure(self._structureName())
+        try:
+            return self._fromStringInner(data, offset, offset0)
+        finally:
+            if self.limits is not None and not isinstance(self, NDRPOINTER):
+                self.limits.leaveStructure()
+                self.limits.leave(self._structureName())
+
+    def _fromStringInner(self, data, offset, offset0):
         # 14.3.7.1 Structures Containing a Conformant Array
         # A structure can contain a conformant array only as its last member.
-        # In the NDR representation of a structure that contains a conformant array, 
-        # the unsigned long integers that give maximum element counts for dimensions of the array 
-        # are moved to the beginning of the structure, and the array elements appear in place at 
+        # In the NDR representation of a structure that contains a conformant array,
+        # the unsigned long integers that give maximum element counts for dimensions of the array
+        # are moved to the beginning of the structure, and the array elements appear in place at
         # the end of the structure.
         # 14.3.7.2 Structures Containing a Conformant and Varying Array
         # A structure can contain a conformant and varying array only as its last member.
-        # In the NDR representation of a structure that contains a conformant and varying array, 
-        # the maximum counts for dimensions of the array are moved to the beginning of the structure, 
-        # but the offsets and actual counts remain in place at the end of the structure, 
+        # In the NDR representation of a structure that contains a conformant and varying array,
+        # the maximum counts for dimensions of the array are moved to the beginning of the structure,
+        # but the offsets and actual counts remain in place at the end of the structure,
         # immediately preceding the array elements
         lastItem = (self.commonHdr+self.structure)[-1][0]
 
@@ -1131,9 +1557,9 @@ class NDRSTRUCT(NDRCONSTRUCTEDTYPE):
                 arrayUnPackStr = '<L'
 
             # The size information is itself aligned according to the alignment rules for
-            # primitive data types. (See Section 14.2.2 on page 620.) The data of the constructed 
-            # type is then aligned according to the alignment rules for the constructed type. 
-            # In other words, the size information precedes the structure and is aligned 
+            # primitive data types. (See Section 14.2.2 on page 620.) The data of the constructed
+            # type is then aligned according to the alignment rules for the constructed type.
+            # In other words, the size information precedes the structure and is aligned
             # independently of the structure alignment.
             # We need to check whether we need padding or not
             offset += (arrayItemSize - (offset % arrayItemSize)) % arrayItemSize
@@ -1141,10 +1567,14 @@ class NDRSTRUCT(NDRCONSTRUCTEDTYPE):
             # And let's extract the array size for later use
             if isinstance(self.fields[lastItem], NDRUniConformantArray):
                 # NDRUniConformantArray
+                if self.limits is not None:
+                    self._checkBounds(data, offset, arrayItemSize, lastItem + '.MaximumCount', arrayUnPackStr)
                 arraySize = unpack_from(arrayUnPackStr, data, offset)[0]
                 self.fields[lastItem].setArraySize(arraySize)
             else:
                 # NDRUniConformantVaryingArray
+                if self.limits is not None:
+                    self._checkBounds(data, offset, arrayItemSize, lastItem + '.MaximumCount', arrayUnPackStr)
                 maximumCount = unpack_from(arrayUnPackStr, data, offset)[0]
                 self.fields[lastItem].fields['MaximumCount'] = maximumCount
 
@@ -1152,7 +1582,7 @@ class NDRSTRUCT(NDRCONSTRUCTEDTYPE):
 
         # Now we need to align the structure
         # The alignment of a structure in the octet stream is the largest of the alignments of the fields it
-        # contains. These fields may also be constructed types. The same alignment rules apply 
+        # contains. These fields may also be constructed types. The same alignment rules apply
         # recursively to nested constructed types.
         alignment = self.getAlignment()
         if alignment > 0:
@@ -1216,11 +1646,12 @@ class NDRUNION(NDRCONSTRUCTEDTYPE):
         #1: ('pStatusChangeParam1', PSERVICE_NOTIFY_STATUS_CHANGE_PARAMS_1),
         #2: ('pStatusChangeParams', PSERVICE_NOTIFY_STATUS_CHANGE_PARAMS_2),
     }
-    def __init__(self, data = None, isNDR64=False, topLevel = False):
+    def __init__(self, data = None, isNDR64=False, topLevel = False, limits = _UNSET):
         #ret = NDR.__init__(self,None, isNDR64=isNDR64)
         self.topLevel = topLevel
         self._isNDR64 = isNDR64
         self.fields = {}
+        self.limits = getDefaultLimits() if limits is _UNSET else limits
 
         if isNDR64 is True:
             if self.commonHdr64 != ():
@@ -1233,14 +1664,14 @@ class NDRUNION(NDRCONSTRUCTEDTYPE):
         for fieldName, fieldTypeOrClass in self.commonHdr+self.structure+self.referent:
             if self.isNDR(fieldTypeOrClass):
                if self.isPointer(fieldTypeOrClass):
-                   self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64, topLevel = topLevel)
+                   self.fields[fieldName] = self._newNDR(fieldTypeOrClass, topLevel = topLevel)
                elif self.isUnion(fieldTypeOrClass):
-                   self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64, topLevel = topLevel)
+                   self.fields[fieldName] = self._newNDR(fieldTypeOrClass, topLevel = topLevel)
                else:
-                   self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64)
+                   self.fields[fieldName] = self._newNDR(fieldTypeOrClass)
             elif fieldTypeOrClass == ':':
                self.fields[fieldName] = None
-            elif len(fieldTypeOrClass.split('=')) == 2: 
+            elif len(fieldTypeOrClass.split('=')) == 2:
                try:
                    self.fields[fieldName] = eval(fieldTypeOrClass.split('=')[1])
                except:
@@ -1258,7 +1689,7 @@ class NDRUNION(NDRCONSTRUCTEDTYPE):
             if value in self.union:
                 self.structure = (self.union[value]),
                 # Init again the structure
-                self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel)
+                self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel, limits=self.limits)
                 self.fields['tag']['Data'] = value
             else:
                 # Let's see if we have a default value
@@ -1268,7 +1699,7 @@ class NDRUNION(NDRCONSTRUCTEDTYPE):
                     else:
                         self.structure = (self.union['default']),
                         # Init again the structure
-                        self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel)
+                        self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel, limits=self.limits)
                     self.fields['tag']['Data'] = 0xffff
                 else:
                     raise Exception("Unknown tag %d for union!" % value)
@@ -1360,7 +1791,7 @@ class NDRUNION(NDRCONSTRUCTEDTYPE):
             tag = unpack_from(tagtype, data, offset)[0]
             if tag in self.union:
                 self.structure = (self.union[tag]),
-                self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel)
+                self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel, limits=self.limits)
             else:
                 # Let's see if we have a default value
                 if 'default' in self.union:
@@ -1369,7 +1800,7 @@ class NDRUNION(NDRCONSTRUCTEDTYPE):
                     else:
                         self.structure = (self.union['default']),
                         # Init again the structure
-                        self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel)
+                        self.__init__(None, isNDR64=self._isNDR64, topLevel = self.topLevel, limits=self.limits)
                     self.fields['tag']['Data'] = 0xffff
                 else:
                     raise Exception("Unknown tag %d for union!" % tag)
@@ -1475,8 +1906,8 @@ class NDRPOINTER(NDRSTRUCT):
         # This is the representation of the Referent
         ('Data',':'),
     )
-    def __init__(self, data = None, isNDR64=False, topLevel = False):
-        NDRSTRUCT.__init__(self,None, isNDR64=isNDR64)
+    def __init__(self, data = None, isNDR64=False, topLevel = False, limits = _UNSET):
+        NDRSTRUCT.__init__(self,None, isNDR64=isNDR64, limits=limits)
         # If we are being called from a NDRCALL, it's a TopLevelPointer,
         # if not, it's a embeeded pointer.
         # It is *very* important, for every subclass of NDRPointer
@@ -1485,7 +1916,7 @@ class NDRPOINTER(NDRSTRUCT):
         if topLevel is True:
             self.structure = self.referent
             self.referent = ()
-       
+
         if data is None:
             self.fields['ReferentID'] = random.randint(1,65535)
         else:
@@ -1535,20 +1966,30 @@ class NDRPOINTER(NDRSTRUCT):
         # Do we have a Referent ID == 0?
         if self._isNDR64 is True:
             unpackStr = '<Q'
+            idSize = 8
         else:
             unpackStr = '<L'
+            idSize = 4
 
-        if unpack_from(unpackStr, data, offset)[0] == 0:
+        if self.limits is not None:
+            # A truncated pointer indicator must fail, not unpack garbage.
+            self._checkBounds(data, offset, idSize, 'ReferentID', unpackStr)
+
+        referentID = unpack_from(unpackStr, data, offset)[0]
+        if referentID == 0:
             # Let's save the value
             self['ReferentID'] = 0
             self.fields['Data'] = b''
-            if self._isNDR64 is True:
-                return pad + 8
-            else:
-                return pad + 4
-        else:
-            retVal = NDRSTRUCT.fromString(self, data, offset)
-            return retVal + pad
+            return pad + idSize
+
+        if self.limits is not None:
+            # Every non-NULL pointer occurrence counts against the shared
+            # referent budget. The historical decoder materializes a referent
+            # body per pointer even when two pointers alias the same ID; the
+            # budget stays additive so decoding semantics do not change.
+            self.limits.registerReferent(self._structureName(), referentID)
+        retVal = NDRSTRUCT.fromString(self, data, offset)
+        return retVal + pad
 
     def dump(self, msg = None, indent = 0):
         if msg is None:
@@ -1585,8 +2026,8 @@ class PNDRUniConformantArray(NDRPOINTER):
     referent = (
         ('Data', NDRUniConformantArray),
     )
-    def __init__(self, data = None, isNDR64 = False, topLevel = False):
-        NDRPOINTER.__init__(self,data,isNDR64,topLevel)
+    def __init__(self, data = None, isNDR64 = False, topLevel = False, limits = None):
+        NDRPOINTER.__init__(self,data,isNDR64,topLevel,limits=limits)
 
 class NDRCALL(NDRCONSTRUCTEDTYPE):
     # This represents a group of NDR instances that conforms an NDR Call.
@@ -1598,9 +2039,10 @@ class NDRCALL(NDRCONSTRUCTEDTYPE):
     structure      = ()
     structure64    = ()
     align          = 4
-    def __init__(self, data = None, isNDR64 = False):
+    def __init__(self, data = None, isNDR64 = False, limits = _UNSET):
         self._isNDR64 = isNDR64
         self.fields = {}
+        self.limits = getDefaultLimits() if limits is _UNSET else limits
 
         if isNDR64 is True:
             if self.commonHdr64 != ():
@@ -1613,11 +2055,11 @@ class NDRCALL(NDRCONSTRUCTEDTYPE):
         for fieldName, fieldTypeOrClass in self.commonHdr+self.structure+self.referent:
             if self.isNDR(fieldTypeOrClass):
                if self.isPointer(fieldTypeOrClass):
-                   self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64, topLevel = True)
+                   self.fields[fieldName] = self._newNDR(fieldTypeOrClass, topLevel = True)
                elif self.isUnion(fieldTypeOrClass):
-                   self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64, topLevel = True)
+                   self.fields[fieldName] = self._newNDR(fieldTypeOrClass, topLevel = True)
                else:
-                   self.fields[fieldName] = fieldTypeOrClass(isNDR64 = self._isNDR64)
+                   self.fields[fieldName] = self._newNDR(fieldTypeOrClass)
             elif fieldTypeOrClass == ':':
                self.fields[fieldName] = None
             elif len(fieldTypeOrClass.split('=')) == 2:
@@ -1685,27 +2127,35 @@ class NDRCALL(NDRCONSTRUCTEDTYPE):
 
     def fromString(self, data, offset=0):
         offset0 = offset
-        for fieldName, fieldTypeOrClass in self.commonHdr+self.structure:
-            try:
-                # Are we dealing with an array?
-                if isinstance(self.fields[fieldName], NDRUniConformantArray) or isinstance(self.fields[fieldName],
-                              NDRUniConformantVaryingArray):
-                    # Yes, get the array size
-                    arraySize, advanceStream = self.getArraySize(fieldName, data, offset)
-                    self.fields[fieldName].setArraySize(arraySize)
-                    offset += advanceStream
+        if self.limits is not None:
+            self.limits.enter(self._structureName())
+            self.limits.enterStructure(self._structureName())
+        try:
+            for fieldName, fieldTypeOrClass in self.commonHdr+self.structure:
+                try:
+                    # Are we dealing with an array?
+                    if isinstance(self.fields[fieldName], NDRUniConformantArray) or isinstance(self.fields[fieldName],
+                                  NDRUniConformantVaryingArray):
+                        # Yes, get the array size
+                        arraySize, advanceStream = self.getArraySize(fieldName, data, offset)
+                        self.fields[fieldName].setArraySize(arraySize)
+                        offset += advanceStream
 
-                size = self.unpack(fieldName, fieldTypeOrClass, data, offset)
+                    size = self.unpack(fieldName, fieldTypeOrClass, data, offset)
 
-                # Any referent information to unpack?
-                if isinstance(self.fields[fieldName], NDRCONSTRUCTEDTYPE):
-                    size += self.fields[fieldName].fromStringReferents(data, offset+size)
-                    size += self.fields[fieldName].fromStringReferent(data, offset+size)
-                offset += size
-            except Exception as e:
-                LOG.error(str(e))
-                LOG.error("Error unpacking field '%s | %s | %r'" % (fieldName, fieldTypeOrClass, data[offset:offset+256]))
-                raise
+                    # Any referent information to unpack?
+                    if isinstance(self.fields[fieldName], NDRCONSTRUCTEDTYPE):
+                        size += self.fields[fieldName].fromStringReferents(data, offset+size)
+                        size += self.fields[fieldName].fromStringReferent(data, offset+size)
+                    offset += size
+                except Exception as e:
+                    LOG.error(str(e))
+                    LOG.error("Error unpacking field '%s | %s | %r'" % (fieldName, fieldTypeOrClass, data[offset:offset+256]))
+                    raise
+        finally:
+            if self.limits is not None:
+                self.limits.leaveStructure()
+                self.limits.leave(self._structureName())
 
         return offset - offset0
 

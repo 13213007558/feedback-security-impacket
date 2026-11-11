@@ -902,7 +902,7 @@ class REPLENTINFLIST(NDRSTRUCT):
     # ToDo: Here we should work with getData and fromString because we're cheating with pNextEntInf
     def fromString(self, data, soFar = 0 ):
         # Here we're changing the struct so we can represent a linked list with NDR
-        self.fields['pNextEntInf'] = PREPLENTINFLIST(isNDR64 = self._isNDR64)
+        self.fields['pNextEntInf'] = self._newNDR(PREPLENTINFLIST)
         retVal = NDRSTRUCT.fromString(self, data, soFar)
         return retVal
 
