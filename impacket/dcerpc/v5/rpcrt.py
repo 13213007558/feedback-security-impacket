@@ -1039,6 +1039,20 @@ class DCERPCException(Exception):
         else:
             return 'DCERPC Runtime Error: unknown error code: 0x%x' % self.error_code
 
+class DCERPCVerificationError(DCERPCException):
+    """
+    Raised when an inbound DCE/RPC PDU fails structural or per-fragment
+    authentication verification. The fragment that triggered the failure and
+    the reason are recorded so callers can prove no stub data was delivered.
+    """
+    def __init__(self, reason, fragment_index, call_id=None):
+        error_string = 'DCE/RPC fragment verification failed: %s (fragment #%d, call_id=%s)' % (
+            reason, fragment_index, call_id)
+        DCERPCException.__init__(self, error_string=error_string)
+        self.reason = reason
+        self.fragment_index = fragment_index
+        self.call_id = call_id
+
 # Context Item
 class CtxItem(Structure):
     structure = (
@@ -1477,6 +1491,46 @@ class DCERPC_v5(DCERPC):
         self.__confounder = b''
         self.__gss = None
 
+        # Inbound (server-side receive direction) verification state. It is kept
+        # separate from the outbound __sequence counter so that verifying traffic
+        # does not interfere with traffic we generate ourselves.
+        self.__verify_inbound = False
+        self.__recv_sequence = 0
+        self.__recv_fragment_index = None
+        self.__recv_call_id = None
+        self.__recv_ctx_id = None
+        self.__recv_seal_offset = 0
+
+    def set_inbound_verification(self, enabled):
+        """
+        Enables or disables strict per-fragment authentication verification on
+        every PDU read through recv(). When enabled, each fragment of a
+        multi-fragment call is authenticated independently before any of its
+        bytes are appended to the reassembled stub, and a DCERPCVerificationError
+        is raised on the first fragment that fails.
+        """
+        self.__verify_inbound = enabled
+        self.__recv_sequence = 0
+        self.__recv_fragment_index = None
+        self.__recv_call_id = None
+        self.__recv_ctx_id = None
+        self.__recv_seal_offset = 0
+
+    def configure_inbound_ntlm_session(self, flags, session_key):
+        """
+        Derives the NTLM signing/sealing key material used to verify inbound
+        PDUs from the negotiated session key. Local test harnesses and servers
+        use this to install the same key material negotiated during BIND without
+        driving a full NTLM exchange over the wire.
+        """
+        self.__flags = flags
+        self.__sessionKey = session_key
+        self.__serverSigningKey = ntlm.SIGNKEY(flags, session_key)
+        self.__serverSealingKey = ntlm.SEALKEY(flags, session_key)
+        cipher = ARC4.new(self.__serverSealingKey)
+        self.__serverSealingHandle = cipher.encrypt
+        self.__recv_seal_offset = 0
+
     def set_aes(self, is_aes):
         self.__aesNegociated = is_aes
 
@@ -1741,13 +1795,18 @@ class DCERPC_v5(DCERPC):
                     if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
                         # When NTLM2 is on, we sign the whole pdu, but encrypt just
                         # the data, not the dcerpc header. Weird..
-                        sealedMessage, signature =  ntlm.SEAL(self.__flags, 
-                               self.__clientSigningKey, 
-                               self.__clientSealingKey,  
-                               rpc_packet.get_packet()[:-16], 
-                               plain_data, 
-                               self.__sequence, 
-                               self.__clientSealingHandle)
+                        # The message signature's SeqNum MUST be encrypted with a
+                        # fresh RC4 handle over the sealing key (MS-NLMP 3.4.4),
+                        # not with the long-lived handle already advanced by the
+                        # payload encryption, otherwise every sealed fragment
+                        # carries a signature the peer cannot verify.
+                        sealedMessage = self.__clientSealingHandle(plain_data)
+                        sign_cipher = ARC4.new(self.__clientSealingKey)
+                        signature = ntlm.SIGN(self.__flags,
+                               self.__clientSigningKey,
+                               rpc_packet.get_packet()[:-16],
+                               self.__sequence,
+                               sign_cipher.encrypt)
                     else:
                         sealedMessage, signature =  ntlm.SEAL(self.__flags, 
                                self.__clientSigningKey, 
@@ -1763,16 +1822,20 @@ class DCERPC_v5(DCERPC):
                     sealedMessage, signature = self.__gss.GSS_Wrap(self.__sessionKey, plain_data, self.__sequence)
 
                 rpc_packet['pduData'] = sealedMessage
-            elif self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_INTEGRITY: 
+            elif self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_INTEGRITY:
                 if self.__auth_type == RPC_C_AUTHN_WINNT:
                     if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                        # Interesting thing.. with NTLM2, what is is signed is the 
-                        # whole PDU, not just the data
+                        # Interesting thing.. with NTLM2, what is is signed is the
+                        # whole PDU, not just the data. The signature's SeqNum is
+                        # encrypted with a fresh RC4 handle over the sealing key
+                        # (MS-NLMP 3.4.4); reusing the long-lived handle here would
+                        # desynchronize every PDU after the first one.
+                        sign_cipher = ARC4.new(self.__clientSealingKey)
                         signature =  ntlm.SIGN(self.__flags,
-                               self.__clientSigningKey, 
-                               rpc_packet.get_packet()[:-16], 
-                               self.__sequence, 
-                               self.__clientSealingHandle)
+                               self.__clientSigningKey,
+                               rpc_packet.get_packet()[:-16],
+                               self.__sequence,
+                               sign_cipher.encrypt)
                     else:
                         signature =  ntlm.SIGN(self.__flags, 
                                self.__clientSigningKey, 
@@ -1860,7 +1923,195 @@ class DCERPC_v5(DCERPC):
             self._transport_send(data)
         self.__callid += 1
 
+    def __verify_fragment(self, response_data, response_header):
+        """
+        Authenticates and, when required, decrypts a single inbound fragment.
+
+        Every fragment of a multi-fragment call goes through this routine with
+        its own sec_trailer/auth_data, so one valid final fragment can never
+        launder an earlier fragment whose signature, padding or header fields
+        were tampered with. Returns the plaintext stub bytes contributed by this
+        fragment (auth padding already stripped). Raises DCERPCVerificationError
+        on the first failed check, before any byte is handed to the caller.
+        """
+        index = self.__recv_fragment_index
+        call_id = response_header['call_id']
+        flags = response_header['flags']
+        frag_len = response_header['frag_len']
+
+        # 1) Frame structure sanity checks
+        if frag_len != len(response_data):
+            raise DCERPCVerificationError('declared frag_len %d does not match received size %d'
+                                          % (frag_len, len(response_data)), index, call_id)
+        if response_header['auth_len'] == 0:
+            raise DCERPCVerificationError('authenticated fragment is missing its security verifier',
+                                          index, call_id)
+        auth_total = response_header['auth_len'] + 8
+        if auth_total > frag_len - response_header.get_header_size():
+            raise DCERPCVerificationError('auth_len %d exceeds fragment body'
+                                          % response_header['auth_len'], index, call_id)
+
+        off = response_header.get_header_size()
+        answer = response_data[off:]
+        auth_data = answer[-auth_total:]
+        sec_trailer = SEC_TRAILER(data=auth_data)
+        auth_pad_len = sec_trailer['auth_pad_len']
+        sealed_or_signed = answer[:-auth_total]
+
+        if sec_trailer['auth_level'] != self.__auth_level:
+            raise DCERPCVerificationError('fragment auth_level %d does not match session auth_level %d'
+                                          % (sec_trailer['auth_level'], self.__auth_level), index, call_id)
+        if sec_trailer['auth_type'] != self.__auth_type:
+            raise DCERPCVerificationError('fragment auth_type %d does not match session auth_type %d'
+                                          % (sec_trailer['auth_type'], self.__auth_type), index, call_id)
+        if auth_pad_len > 3:
+            raise DCERPCVerificationError('invalid auth_pad_len %d' % auth_pad_len, index, call_id)
+        if auth_pad_len >= len(sealed_or_signed):
+            raise DCERPCVerificationError('auth_pad_len %d consumes the whole fragment body'
+                                          % auth_pad_len, index, call_id)
+
+        # 2) Fragment state machine: a call starts with exactly one FIRST frag,
+        # every subsequent fragment must not be FIRST, and call/context ids must
+        # stay constant across all fragments of the same call.
+        if index == 0:
+            if not (flags & PFC_FIRST_FRAG):
+                raise DCERPCVerificationError('first fragment of call is missing PFC_FIRST_FRAG',
+                                              index, call_id)
+            self.__recv_call_id = call_id
+            self.__recv_ctx_id = response_header['ctx_id']
+        else:
+            if flags & PFC_FIRST_FRAG:
+                raise DCERPCVerificationError('unexpected PFC_FIRST_FRAG inside an ongoing call',
+                                              index, call_id)
+            if call_id != self.__recv_call_id:
+                raise DCERPCVerificationError('call_id changed from %s to %s mid-call'
+                                              % (self.__recv_call_id, call_id), index, call_id)
+            if response_header['ctx_id'] != self.__recv_ctx_id:
+                raise DCERPCVerificationError('context_id changed from %s to %s mid-call'
+                                              % (self.__recv_ctx_id, response_header['ctx_id']),
+                                              index, call_id)
+
+        plaintext = sealed_or_signed
+        if self.__auth_type != RPC_C_AUTHN_WINNT:
+            raise DCERPCVerificationError('inbound verification only implemented for RPC_C_AUTHN_WINNT',
+                                          index, call_id)
+
+        ntlm2 = self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        wire_signature = ntlm.NTLMMessageSignature(self.__flags, data=auth_data[8:])
+
+        if self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
+            # NTLM2 sealing is a single RC4 keystream that runs for the whole
+            # authenticated association (across every fragment and every call).
+            # Remember the stream position before decrypting so a failed
+            # verification can roll the long-lived handle back and keep the next
+            # valid call decryptable.
+            stream_offset_before = self.__recv_seal_offset
+            plaintext = self.__serverSealingHandle(sealed_or_signed)
+            if ntlm2:
+                # The whole PDU was signed before encryption: header and
+                # sec_trailer travel in cleartext, while the body is replaced by
+                # its plaintext to reproduce the exact blob the sender MACed.
+                signed_blob = (response_data[:off] + plaintext
+                               + response_data[off + len(sealed_or_signed):frag_len - auth_total]
+                               + auth_data[:8])
+                # The signature's SeqNum is encrypted through a separate fresh
+                # RC4 handle (MS-NLMP 3.4.4), never the payload stream.
+                sign_cipher = ARC4.new(self.__serverSealingKey)
+                expected = ntlm.SIGN(self.__flags, self.__serverSigningKey, signed_blob,
+                                     self.__recv_sequence, sign_cipher.encrypt)
+            else:
+                expected = ntlm.SIGN(self.__flags, self.__serverSigningKey, plaintext,
+                                     self.__recv_sequence, self.__serverSealingHandle)
+        elif self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_INTEGRITY:
+            if ntlm2:
+                signed_blob = response_data[:frag_len - auth_total] + auth_data[:8]
+                expected = ntlm.SIGN(self.__flags, self.__serverSigningKey, signed_blob,
+                                     self.__recv_sequence,
+                                     ARC4.new(self.__serverSealingKey).encrypt)
+            else:
+                expected = ntlm.SIGN(self.__flags, self.__serverSigningKey, wire_signature.getData(),
+                                     self.__recv_sequence, self.__serverSealingHandle)
+        else:
+            raise DCERPCVerificationError('unsupported auth_level %d for inbound verification'
+                                          % self.__auth_level, index, call_id)
+
+        if expected.getData() != wire_signature.getData():
+            if self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
+                # Rewind the RC4 payload stream to its pre-fragment position.
+                cipher = ARC4.new(self.__serverSealingKey)
+                self.__serverSealingHandle = cipher.encrypt
+                self.__serverSealingHandle(b'\x00' * stream_offset_before)
+                self.__recv_seal_offset = stream_offset_before
+            raise DCERPCVerificationError('per-fragment signature mismatch', index, call_id)
+
+        # 3) The signature is valid. Only now do we consume sequence/cipher state
+        # and expose plaintext, with the auth padding stripped.
+        stub = plaintext[:len(plaintext) - auth_pad_len] if auth_pad_len else plaintext
+        self.__recv_sequence += 1
+        if self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
+            self.__recv_seal_offset += len(sealed_or_signed)
+        return stub
+
     def recv(self):
+        if self.__verify_inbound and self.__auth_level in (
+                RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, RPC_C_AUTHN_LEVEL_PKT_PRIVACY):
+            return self.__recv_verified()
+        return self.__recv_legacy()
+
+    def __recv_verified(self):
+        finished = False
+        forceRecv = 0
+        retAnswer = b''
+        # Every recv() call is a fresh call on the association; initialize the
+        # reassembly state machine here so a previously rejected call cannot
+        # affect the next one.
+        self.__recv_fragment_index = 0
+        self.__recv_call_id = None
+        self.__recv_ctx_id = None
+        try:
+            while not finished:
+                # At least give me the MSRPCRespHeader, especially important for
+                # TCP/UDP Transports
+                response_data = self._transport.recv(forceRecv, count=MSRPCRespHeader._SIZE)
+                if not response_data:
+                    raise DCERPCException('connection closed while reading DCE/RPC fragment')
+                response_header = MSRPCRespHeader(response_data)
+                # The transport layer might hand us partial contents for large
+                # packets; keep reading until the full fragment is available.
+                while len(response_data) < response_header['frag_len']:
+                    chunk = self._transport.recv(
+                        forceRecv, count=(response_header['frag_len'] - len(response_data)))
+                    if not chunk:
+                        raise DCERPCException('connection closed in the middle of a DCE/RPC fragment')
+                    response_data += chunk
+
+                if response_header['type'] == MSRPC_FAULT:
+                    raise DCERPCException('DCE/RPC fault received on authenticated connection',
+                                          packet=response_data)
+
+                answer = self.__verify_fragment(response_data, response_header)
+                retAnswer += answer
+
+                if response_header['flags'] & PFC_LAST_FRAG:
+                    finished = True
+                else:
+                    forceRecv = 1
+                    self.__recv_fragment_index += 1
+        except BaseException:
+            # A failed fragment must never be partially delivered: discard every
+            # plaintext byte accumulated for this call and reset the reassembly
+            # state machine so the next call on the same connection starts clean.
+            self.__recv_fragment_index = None
+            self.__recv_call_id = None
+            self.__recv_ctx_id = None
+            raise
+        # Full call reassembled only after every fragment was authenticated.
+        self.__recv_fragment_index = None
+        self.__recv_call_id = None
+        self.__recv_ctx_id = None
+        return retAnswer
+
+    def __recv_legacy(self):
         finished = False
         forceRecv = 0
         retAnswer = b''
